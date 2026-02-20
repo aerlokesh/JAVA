@@ -20,12 +20,12 @@ class UnauthorizedException extends Exception {
 
 // ==================== DOMAIN CLASSES ====================
 
-// User
-class User {
+// FBUser
+class FBUser {
     String id;
     String name;
 
-    User(String name) {
+    FBUser(String name) {
         this.id = "USER-" + UUID.randomUUID().toString().substring(0, 6);
         this.name = name;
     }
@@ -100,7 +100,7 @@ class CommentService {
     Map<String, Post> posts;           // postId -> Post
     Map<String, Comment> comments;     // commentId -> Comment
     Map<String, List<String>> postComments; // postId -> list of top-level comment IDs
-    Map<String, User> users;           // userId -> User
+    Map<String, FBUser> users;           // userId -> FBUser
 
     CommentService() {
         this.posts = new ConcurrentHashMap<>();
@@ -109,7 +109,7 @@ class CommentService {
         this.users = new ConcurrentHashMap<>();
     }
 
-    void registerUser(User user) { users.put(user.id, user); }
+    void registerUser(FBUser user) { users.put(user.id, user); }
     void addPost(Post post) {
         posts.put(post.id, post);
         postComments.put(post.id, Collections.synchronizedList(new ArrayList<>()));
@@ -120,7 +120,7 @@ class CommentService {
             throws CommentNotFoundException {
         Post post = posts.get(postId);
         if (post == null) throw new CommentNotFoundException("Post not found: " + postId);
-        User user = users.get(userId);
+        FBUser user = users.get(userId);
 
         synchronized (post) {
             // Validate parent if it's a reply
@@ -206,7 +206,7 @@ class CommentService {
         Post post = posts.get(comment.postId);
         synchronized (post) {
             comment.addReaction(userId, reaction);
-            User user = users.get(userId);
+            FBUser user = users.get(userId);
             System.out.println(Thread.currentThread().getName() + ": " + user.name
                 + " reacted " + reaction + " on [" + commentId + "]");
         }
@@ -275,11 +275,11 @@ public class FacebookCommentSection {
         // ---- Setup ----
         CommentService service = new CommentService();
 
-        User alice = new User("Alice");
-        User bob = new User("Bob");
-        User charlie = new User("Charlie");
-        User dave = new User("Dave");
-        User eve = new User("Eve");
+        FBUser alice = new FBUser("Alice");
+        FBUser bob = new FBUser("Bob");
+        FBUser charlie = new FBUser("Charlie");
+        FBUser dave = new FBUser("Dave");
+        FBUser eve = new FBUser("Eve");
         service.registerUser(alice);
         service.registerUser(bob);
         service.registerUser(charlie);
@@ -378,7 +378,7 @@ public class FacebookCommentSection {
 
         for (int i = 0; i < 10; i++) {
             final int num = i;
-            final User user = (num % 2 == 0) ? bob : charlie;
+            final FBUser user = (num % 2 == 0) ? bob : charlie;
             Thread t = new Thread(() -> {
                 try {
                     Comment c = service.addComment(post.id, user.id, null,
@@ -401,7 +401,7 @@ public class FacebookCommentSection {
         System.out.println("\n=== Test 8: CONCURRENT REACTIONS (5 users reacting simultaneously) ===");
         threads.clear();
         String targetComment = commentIds.get(0);
-        User[] reactors = {alice, bob, charlie, dave, eve};
+        FBUser[] reactors = {alice, bob, charlie, dave, eve};
         ReactionType[] reactionTypes = {ReactionType.LIKE, ReactionType.LOVE, ReactionType.HAHA,
                                         ReactionType.WOW, ReactionType.SAD};
 

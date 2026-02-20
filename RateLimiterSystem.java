@@ -23,10 +23,34 @@ interface RateLimiter {
 
 // ==================== IMPLEMENTATIONS ====================
 
-// 1. TOKEN BUCKET - allows bursts, refills over time
+// =====================================================================
+// 1. TOKEN BUCKET ALGORITHM
+// =====================================================================
+// HOW IT WORKS:
+//   - Imagine a bucket that holds tokens (max = capacity)
+//   - Tokens are added at a fixed rate (refillRate tokens/second)
+//   - Each request consumes 1 token
+//   - If bucket has tokens → ALLOW (consume 1 token)
+//   - If bucket is empty → DENY
+//
+// WHY USE IT:
+//   - Allows BURSTS: if bucket is full, you can send `capacity` requests instantly
+//   - Then throttles to `refillRate` requests/second
+//   - Good for: APIs that tolerate short bursts but need average rate control
+//
+// EXAMPLE (capacity=5, refillRate=2/s):
+//   t=0s: bucket=5 → send 5 requests instantly (burst) → bucket=0
+//   t=0s: 6th request → DENIED (bucket empty)
+//   t=1s: bucket refills +2 tokens → bucket=2
+//   t=1s: send 2 requests → bucket=0
+//
+// DATA STRUCTURE: double[2] per client
+//   [0] = current token count (double for fractional tokens)
+//   [1] = last refill timestamp (nanoTime)
+// =====================================================================
 class TokenBucketRateLimiter implements RateLimiter {
-    private final int capacity;         // max tokens
-    private final double refillRate;    // tokens per second
+    private final int capacity;         // max tokens the bucket can hold
+    private final double refillRate;    // tokens added per second
     private final ConcurrentHashMap<String, double[]> buckets; // [tokens, lastRefillTimestamp]
 
     TokenBucketRateLimiter(int capacity, double refillRate) {
@@ -37,20 +61,24 @@ class TokenBucketRateLimiter implements RateLimiter {
 
     @Override
     public synchronized boolean allowRequest(String clientId) {
+        // Step 1: Get or create bucket for this client (starts full)
         double[] bucket = buckets.computeIfAbsent(clientId,
             k -> new double[]{capacity, System.nanoTime()});
 
-        // Refill tokens based on elapsed time
+        // Step 2: Calculate how many tokens to add based on time elapsed
+        //   Formula: newTokens = elapsedSeconds × refillRate
+        //   Cap at capacity (bucket can't overflow)
         double now = System.nanoTime();
-        double elapsed = (now - bucket[1]) / 1_000_000_000.0; // seconds
+        double elapsed = (now - bucket[1]) / 1_000_000_000.0; // convert nanos → seconds
         bucket[0] = Math.min(capacity, bucket[0] + elapsed * refillRate);
-        bucket[1] = now;
+        bucket[1] = now; // update last refill time
 
+        // Step 3: Try to consume 1 token
         if (bucket[0] >= 1.0) {
-            bucket[0] -= 1.0;
-            return true;
+            bucket[0] -= 1.0; // consume token
+            return true;      // ALLOWED
         }
-        return false;
+        return false;          // DENIED - no tokens left
     }
 
     @Override
@@ -64,10 +92,44 @@ class TokenBucketRateLimiter implements RateLimiter {
     }
 }
 
-// 2. FIXED WINDOW - resets counter every window
+// =====================================================================
+// 2. FIXED WINDOW ALGORITHM
+// =====================================================================
+// HOW IT WORKS:
+//   - Divide time into fixed windows (e.g., every 1000ms)
+//   - Each window has a counter starting at 0
+//   - Each request increments the counter
+//   - If counter < maxRequests → ALLOW
+//   - If counter >= maxRequests → DENY
+//   - When window expires → counter resets to 0
+//
+// WHY USE IT:
+//   - Simple to implement and understand
+//   - Predictable: exactly N requests per window
+//   - Good for: login endpoints, simple rate limits
+//
+// WEAKNESS - BOUNDARY BURST PROBLEM:
+//   Window size = 1s, max = 3
+//   t=0.9s: send 3 requests (all allowed, window 0-1s)
+//   t=1.0s: window resets!
+//   t=1.1s: send 3 more requests (all allowed, window 1-2s)
+//   Result: 6 requests in 0.2 seconds! (solved by Sliding Window)
+//
+// EXAMPLE (max=3, window=1000ms):
+//   t=0ms:   req1 → count=1 → ALLOWED
+//   t=100ms: req2 → count=2 → ALLOWED
+//   t=200ms: req3 → count=3 → ALLOWED
+//   t=300ms: req4 → count=3 → DENIED (limit reached)
+//   t=1000ms: window resets → count=0
+//   t=1100ms: req5 → count=1 → ALLOWED
+//
+// DATA STRUCTURE: long[2] per client
+//   [0] = window start timestamp
+//   [1] = request count in current window
+// =====================================================================
 class FixedWindowRateLimiter implements RateLimiter {
-    private final int maxRequests;
-    private final long windowMillis;
+    private final int maxRequests;       // max requests allowed per window
+    private final long windowMillis;     // window duration in milliseconds
     private final ConcurrentHashMap<String, long[]> windows; // [windowStart, count]
 
     FixedWindowRateLimiter(int maxRequests, long windowMillis) {
@@ -79,19 +141,22 @@ class FixedWindowRateLimiter implements RateLimiter {
     @Override
     public synchronized boolean allowRequest(String clientId) {
         long now = System.currentTimeMillis();
+
+        // Step 1: Get or create window for this client
         long[] window = windows.computeIfAbsent(clientId, k -> new long[]{now, 0});
 
-        // Reset if window expired
+        // Step 2: Check if current window has expired → reset
         if (now - window[0] >= windowMillis) {
-            window[0] = now;
-            window[1] = 0;
+            window[0] = now;  // start new window
+            window[1] = 0;    // reset counter
         }
 
+        // Step 3: Check if under limit
         if (window[1] < maxRequests) {
-            window[1]++;
-            return true;
+            window[1]++;     // increment counter
+            return true;     // ALLOWED
         }
-        return false;
+        return false;        // DENIED - window limit reached
     }
 
     @Override
@@ -105,11 +170,44 @@ class FixedWindowRateLimiter implements RateLimiter {
     }
 }
 
-// 3. SLIDING WINDOW LOG - tracks individual request timestamps
+// =====================================================================
+// 3. SLIDING WINDOW LOG ALGORITHM
+// =====================================================================
+// HOW IT WORKS:
+//   - Store the EXACT TIMESTAMP of every request in a sorted log (queue)
+//   - On each new request:
+//     1. Remove all timestamps older than (now - windowSize)
+//     2. If remaining count < maxRequests → ALLOW and add timestamp
+//     3. Otherwise → DENY
+//
+// WHY USE IT:
+//   - Most ACCURATE: no boundary burst problem (unlike Fixed Window)
+//   - The window "slides" with each request
+//   - Good for: search APIs, any endpoint needing precise rate limiting
+//
+// TRADE-OFF:
+//   - Uses more memory (stores each timestamp vs just a counter)
+//   - O(n) cleanup on each request (but n is bounded by maxRequests)
+//
+// EXAMPLE (max=5, window=2000ms):
+//   t=0ms:    req1 → log=[0]           → size=1 < 5 → ALLOWED
+//   t=100ms:  req2 → log=[0,100]       → size=2 < 5 → ALLOWED
+//   t=500ms:  req3 → log=[0,100,500]   → size=3 < 5 → ALLOWED
+//   t=800ms:  req4 → log=[0,100,500,800] → size=4 → ALLOWED
+//   t=900ms:  req5 → log=[0,100,500,800,900] → size=5 → ALLOWED
+//   t=1000ms: req6 → log=[0,100,500,800,900] → size=5 → DENIED
+//   t=2100ms: req7 → evict [0,100] (>2s old) → log=[500,800,900]
+//                    → size=3 < 5 → ALLOWED, log=[500,800,900,2100]
+//
+// DATA STRUCTURE: Deque<Long> per client (timestamps in order)
+//   - addLast() for new timestamps
+//   - pollFirst() to evict expired ones
+//   - Deque acts as a sliding window over time
+// =====================================================================
 class SlidingWindowLogRateLimiter implements RateLimiter {
-    private final int maxRequests;
-    private final long windowMillis;
-    private final ConcurrentHashMap<String, Deque<Long>> logs; // timestamps
+    private final int maxRequests;       // max requests in the sliding window
+    private final long windowMillis;     // window size in milliseconds
+    private final ConcurrentHashMap<String, Deque<Long>> logs; // timestamp logs per client
 
     SlidingWindowLogRateLimiter(int maxRequests, long windowMillis) {
         this.maxRequests = maxRequests;
@@ -120,18 +218,22 @@ class SlidingWindowLogRateLimiter implements RateLimiter {
     @Override
     public synchronized boolean allowRequest(String clientId) {
         long now = System.currentTimeMillis();
+
+        // Step 1: Get or create timestamp log for this client
         Deque<Long> log = logs.computeIfAbsent(clientId, k -> new ArrayDeque<>());
 
-        // Remove expired timestamps
+        // Step 2: Evict all timestamps outside the sliding window
+        //   Any timestamp older than (now - windowMillis) is expired
         while (!log.isEmpty() && now - log.peekFirst() >= windowMillis) {
-            log.pollFirst();
+            log.pollFirst(); // remove oldest expired timestamp
         }
 
+        // Step 3: Check if under limit
         if (log.size() < maxRequests) {
-            log.addLast(now);
-            return true;
+            log.addLast(now); // record this request's timestamp
+            return true;      // ALLOWED
         }
-        return false;
+        return false;         // DENIED - too many requests in window
     }
 
     @Override

@@ -561,6 +561,186 @@ public class StreamsPractice {
         return numbers.stream().filter(x->x%2==0).map(x->x*x).distinct().sorted(Comparator.reverseOrder()).limit(3).collect(Collectors.toList());
     }
     
+    // ==================== MISSING INTERVIEW TOPICS ====================
+
+    /**
+     * Task 51: Parallel stream - sum large list
+     * Shows: parallelStream() for CPU-intensive work
+     */
+    public static long parallelSum(List<Integer> numbers) {
+        return numbers.parallelStream().mapToLong(Integer::longValue).sum();
+    }
+
+    /**
+     * Task 52: peek() for debugging - uppercase and count length
+     * Shows: peek() is intermediate op used to inspect elements mid-pipeline
+     */
+    public static List<String> peekAndTransform(List<String> strings) {
+        return strings.stream()
+            .peek(s -> System.out.println("    Before: " + s))
+            .map(String::toUpperCase)
+            .peek(s -> System.out.println("    After:  " + s))
+            .collect(Collectors.toList());
+    }
+
+    /**
+     * Task 53: Optional handling - safe extraction
+     * Shows: Optional.map, orElse, filter, isPresent
+     */
+    public static String safeFindFirst(List<String> strings, String prefix) {
+        return strings.stream()
+            .filter(s -> s.startsWith(prefix))
+            .findFirst()
+            .map(String::toUpperCase)    // transform if present
+            .orElse("NOT FOUND");        // default if absent
+    }
+
+    /**
+     * Task 54: Stream.of / Stream.iterate / Stream.generate
+     * Shows: creating streams from scratch (not from collections)
+     */
+    public static List<Integer> fibonacciStream(int count) {
+        // Stream.iterate with seed + UnaryOperator (Java 9+ with 2-element array trick)
+        return java.util.stream.Stream
+            .iterate(new int[]{0, 1}, f -> new int[]{f[1], f[0] + f[1]})
+            .limit(count)
+            .map(f -> f[0])
+            .collect(Collectors.toList());
+    }
+
+    /**
+     * Task 55: Collectors.toMap with merge function (handle duplicate keys)
+     * Shows: what happens when two elements map to same key
+     */
+    public static Map<Character, String> groupWordsByFirstChar(List<String> words) {
+        // Key = first char, Value = words joined by comma. Merge on collision.
+        return words.stream()
+            .collect(Collectors.toMap(
+                w -> w.charAt(0),           // key: first character
+                w -> w,                     // value: word itself
+                (existing, newVal) -> existing + "," + newVal  // merge if same key
+            ));
+    }
+
+    /**
+     * Task 56: Downstream collectors - groupingBy with counting & mapping
+     * Shows: nested collectors (most common interview pattern)
+     */
+    public static Map<Integer, Long> countByLength(List<String> strings) {
+        // Group by length, count how many in each group
+        return strings.stream()
+            .collect(Collectors.groupingBy(String::length, Collectors.counting()));
+    }
+
+    /**
+     * Task 57: Collectors.maxBy inside groupingBy
+     * Shows: find max element within each group
+     */
+    public static Map<Integer, Optional<String>> longestInEachLengthGroup(List<String> strings) {
+        return strings.stream()
+            .collect(Collectors.groupingBy(
+                String::length,
+                Collectors.<String, Optional<String>>reducing(Optional.empty(),
+                    s -> Optional.of(s),
+                    (a, b) -> a.isEmpty() ? b : (b.isEmpty() ? a : (a.get().compareTo(b.get()) >= 0 ? a : b)))
+            ));
+    }
+
+    /**
+     * Task 58: Stream.concat - merge two streams
+     */
+    public static List<Integer> mergeAndSort(List<Integer> list1, List<Integer> list2) {
+        return java.util.stream.Stream.concat(list1.stream(), list2.stream())
+            .distinct()
+            .sorted()
+            .collect(Collectors.toList());
+    }
+
+    /**
+     * Task 59: toArray() - convert stream to array
+     */
+    public static int[] toIntArray(List<Integer> numbers) {
+        return numbers.stream().mapToInt(Integer::intValue).toArray();
+    }
+
+    /**
+     * Task 60: takeWhile / dropWhile (Java 9+)
+     * Shows: take elements while condition is true, then stop
+     */
+    public static List<Integer> takeWhileLessThan(List<Integer> sorted, int threshold) {
+        return sorted.stream()
+            .takeWhile(n -> n < threshold)
+            .collect(Collectors.toList());
+    }
+
+    public static List<Integer> dropWhileLessThan(List<Integer> sorted, int threshold) {
+        return sorted.stream()
+            .dropWhile(n -> n < threshold)
+            .collect(Collectors.toList());
+    }
+
+    /**
+     * Task 61: Collectors.collectingAndThen - post-process collector result
+     * Shows: collect to list then make unmodifiable
+     */
+    public static List<String> collectUnmodifiable(List<String> strings) {
+        return strings.stream()
+            .filter(s -> s.length() > 3)
+            .collect(Collectors.collectingAndThen(
+                Collectors.toList(),
+                Collections::unmodifiableList
+            ));
+    }
+
+    /**
+     * Task 62: reduce with 3 args (identity, accumulator, combiner)
+     * Shows: parallel-safe reduce for type-changing operations
+     */
+    public static int totalStringLength(List<String> strings) {
+        // Reduce strings to total character count
+        return strings.stream().reduce(
+            0,                              // identity
+            (sum, str) -> sum + str.length(), // accumulator
+            Integer::sum                    // combiner (for parallel)
+        );
+    }
+
+    /**
+     * Task 63: Collectors.mapping inside groupingBy
+     * Shows: transform values while grouping
+     */
+    public static Map<Integer, List<String>> groupByLengthUppercase(List<String> strings) {
+        return strings.stream()
+            .collect(Collectors.groupingBy(
+                String::length,
+                Collectors.mapping(String::toUpperCase, Collectors.toList())
+            ));
+    }
+
+    /**
+     * Task 64: Frequency map sorted by value descending
+     * Shows: Collectors.groupingBy + sorting a Map by values
+     */
+    public static LinkedHashMap<String, Long> sortedFrequencyMap(List<String> items) {
+        return items.stream()
+            .collect(Collectors.groupingBy(Function.identity(), Collectors.counting()))
+            .entrySet().stream()
+            .sorted(Map.Entry.<String, Long>comparingByValue().reversed())
+            .collect(Collectors.toMap(
+                Map.Entry::getKey, Map.Entry::getValue,
+                (a, b) -> a, LinkedHashMap::new
+            ));
+    }
+
+    /**
+     * Task 65: Partition + downstream counting
+     * Shows: partitioningBy with nested collector
+     */
+    public static Map<Boolean, Long> countEvenOdd(List<Integer> numbers) {
+        return numbers.stream()
+            .collect(Collectors.partitioningBy(n -> n % 2 == 0, Collectors.counting()));
+    }
+
     // ==================== TEST CASES ====================
     
     public static void main(String[] args) {

@@ -1,92 +1,45 @@
 import java.util.*;
+import java.util.stream.Collectors;
 
 // ===== CUSTOM EXCEPTION CLASSES =====
 
-/**
- * Exception thrown when a user is not found
- * WHEN TO THROW:
- * - User ID doesn't exist in the system
- * - Operations attempted on non-existent user
- */
 class UserNotFoundException extends Exception {
     private String userId;
-    
     public UserNotFoundException(String userId) {
         super("User not found: " + userId);
         this.userId = userId;
     }
-    
-    public String getUserId() {
-        return userId;
-    }
+    public String getUserId() { return userId; }
 }
 
-/**
- * Exception thrown when user already exists
- * WHEN TO THROW:
- * - Attempting to add user with duplicate ID
- */
 class UserAlreadyExistsException extends Exception {
     private String userId;
-    
     public UserAlreadyExistsException(String userId) {
         super("User already exists: " + userId);
         this.userId = userId;
     }
-    
-    public String getUserId() {
-        return userId;
-    }
+    public String getUserId() { return userId; }
 }
 
-/**
- * Exception thrown when an expense is invalid
- * WHEN TO THROW:
- * - Negative or zero amount
- * - Empty participant list
- * - Invalid split ratios/amounts
- */
 class InvalidExpenseException extends Exception {
-    public InvalidExpenseException(String message) {
-        super(message);
-    }
+    public InvalidExpenseException(String message) { super(message); }
 }
 
-/**
- * Exception thrown when expense not found
- * WHEN TO THROW:
- * - Expense ID doesn't exist
- */
 class ExpenseNotFoundException extends Exception {
     private String expenseId;
-    
     public ExpenseNotFoundException(String expenseId) {
         super("Expense not found: " + expenseId);
         this.expenseId = expenseId;
     }
-    
-    public String getExpenseId() {
-        return expenseId;
-    }
+    public String getExpenseId() { return expenseId; }
 }
 
-/**
- * Exception thrown when settlement amount is invalid
- * WHEN TO THROW:
- * - Negative settlement amount
- * - Settlement exceeds owed amount
- */
 class InvalidSettlementException extends Exception {
-    public InvalidSettlementException(String message) {
-        super(message);
-    }
+    public InvalidSettlementException(String message) { super(message); }
 }
 
 // ===== SUPPORTING CLASSES =====
 
-/**
- * Represents a user in the system
- */
 class User {
     private String userId;
     private String name;
@@ -103,29 +56,21 @@ class User {
     public String getEmail() { return email; }
     
     @Override
-    public String toString() {
-        return name + " (" + userId + ")";
-    }
+    public String toString() { return name + " (" + userId + ")"; }
 }
 
-/**
- * Enum for expense split types
- */
 enum SplitType {
-    EQUAL,      // Split equally among all participants
-    EXACT,      // Exact amounts specified for each participant
-    PERCENTAGE  // Percentage-based split
+    EQUAL,
+    EXACT,
+    PERCENTAGE
 }
 
-/**
- * Represents an expense in the system
- */
 class Expense {
     private String expenseId;
     private String description;
     private double totalAmount;
-    private String paidBy;  // userId who paid
-    private Map<String, Double> splits;  // userId -> amount they owe
+    private String paidBy;
+    private Map<String, Double> splits;
     private SplitType splitType;
     private long timestamp;
     
@@ -151,46 +96,17 @@ class Expense {
 
 /**
  * Splitwise System - Low Level Design (LLD)
- * 
- * PROBLEM STATEMENT:
- * Design an expense sharing application like Splitwise that can:
- * 1. Add users to the system
- * 2. Create expenses with different split types (equal, exact, percentage)
- * 3. Track balances between users
- * 4. Settle debts between users
- * 5. Show balance sheet and user transactions
- * 
- * REQUIREMENTS:
- * - Functional: Add users, create expenses, settle up, view balances
- * - Non-Functional: Fast balance lookups, accurate calculations, scalable
- * 
- * INTERVIEW HINTS:
- * - Discuss data structures: HashMap for O(1) lookups
- * - Talk about balance simplification (graph algorithms)
- * - Mention database choice (SQL for ACID, NoSQL for scale)
- * - Discuss precision issues with floating point numbers
- * - Consider multi-currency support
  */
 public class SplitwiseSystem {
     
-    // HINT 1: Store users by ID for quick lookup
     private Map<String, User> users;
-    
-    // HINT 2: Store all expenses by ID
     private Map<String, Expense> expenses;
-    
-    // HINT 3: Track balances: Map<userId, Map<otherUserId, amount>>
-    // Positive amount = they owe you, Negative = you owe them
+    // balances: Map<userId, Map<otherUserId, amount>>
+    // Positive = they owe you, Negative = you owe them
     private Map<String, Map<String, Double>> balances;
-    
-    // HINT 4: For generating unique IDs
     private int expenseCounter;
     
-    /**
-     * Constructor - Initialize data structures
-     */
     public SplitwiseSystem() {
-        // TODO: Initialize all maps and counter
         users = new HashMap<>();
         expenses = new HashMap<>();
         balances = new HashMap<>();
@@ -199,292 +115,269 @@ public class SplitwiseSystem {
     
     /**
      * Add a new user to the system
-     * 
-     * IMPLEMENTATION HINTS:
-     * 1. Validate userId is not null/empty
-     * 2. Check if user already exists - throw UserAlreadyExistsException
-     * 3. Create User object and store in users map
-     * 4. Initialize empty balance map for this user
-     * 
-     * @param userId Unique user identifier
-     * @param name User's name
-     * @param email User's email
-     * @throws UserAlreadyExistsException if user already exists
      */
     public void addUser(String userId, String name, String email) throws UserAlreadyExistsException {
-        // TODO: Implement
-        // HINT: if (users.containsKey(userId)) throw new UserAlreadyExistsException(userId);
-        // HINT: balances.put(userId, new HashMap<>());
+        if (userId == null || userId.isEmpty()) return;
+        if (users.containsKey(userId)) throw new UserAlreadyExistsException(userId);
+        users.put(userId, new User(userId, name, email));
+        balances.put(userId, new HashMap<>());
     }
     
     /**
      * Create expense with EQUAL split
-     * 
-     * IMPLEMENTATION HINTS:
-     * 1. Validate amount > 0
-     * 2. Validate all users exist in system
-     * 3. Calculate equal split: totalAmount / participants.size()
-     * 4. Create splits map with equal amounts for each participant
-     * 5. Update balances between paidBy user and each participant
-     * 
-     * @param description Expense description
-     * @param totalAmount Total expense amount
-     * @param paidBy User who paid
-     * @param participants List of users sharing the expense
-     * @return Generated expense ID
-     * @throws UserNotFoundException if any user doesn't exist
-     * @throws InvalidExpenseException if amount or participants invalid
      */
     public String addEqualExpense(String description, double totalAmount, 
                                   String paidBy, List<String> participants) 
             throws UserNotFoundException, InvalidExpenseException {
-        // TODO: Implement
-        // HINT: Validate totalAmount > 0
-        // HINT: Check all users exist (including paidBy)
-        // HINT: double perPerson = totalAmount / participants.size();
-        // HINT: Create splits map and update balances
-        return null;
+        if (totalAmount <= 0) throw new InvalidExpenseException("Amount should be greater than 0");
+        if (participants == null || participants.isEmpty()) throw new InvalidExpenseException("Participants list cannot be empty");
+        if (!users.containsKey(paidBy)) throw new UserNotFoundException(paidBy);
+        for (String userId : participants) {
+            if (!users.containsKey(userId)) throw new UserNotFoundException(userId);
+        }
+        
+        double perPerson = totalAmount / participants.size();
+        Map<String, Double> splits = new HashMap<>();
+        for (String userId : participants) {
+            splits.put(userId, perPerson);
+        }
+        
+        String expenseId = "EXP_" + (++expenseCounter);
+        Expense expense = new Expense(expenseId, description, totalAmount, paidBy, splits, SplitType.EQUAL);
+        expenses.put(expenseId, expense);
+        
+        // Update balances: each participant (except payer) owes the payer
+        for (String userId : participants) {
+            if (userId.equals(paidBy)) continue;  // Skip payer themselves
+            updateBalance(paidBy, userId, perPerson);
+        }
+        return expenseId;
     }
     
     /**
      * Create expense with EXACT amounts for each participant
-     * 
-     * IMPLEMENTATION HINTS:
-     * 1. Validate all users exist
-     * 2. Validate sum of exactAmounts equals totalAmount (with small epsilon for floating point)
-     * 3. Create splits map from exactAmounts
-     * 4. Update balances between paidBy and each participant
-     * 
-     * @param description Expense description
-     * @param totalAmount Total expense amount
-     * @param paidBy User who paid
-     * @param exactAmounts Map of userId -> exact amount they owe
-     * @return Generated expense ID
-     * @throws UserNotFoundException if any user doesn't exist
-     * @throws InvalidExpenseException if amounts don't match total
      */
     public String addExactExpense(String description, double totalAmount, 
                                   String paidBy, Map<String, Double> exactAmounts) 
             throws UserNotFoundException, InvalidExpenseException {
-        // TODO: Implement
-        // HINT: Calculate sum of exactAmounts.values()
-        // HINT: Use Math.abs(sum - totalAmount) < 0.01 for comparison
-        return null;
+        if (totalAmount <= 0) throw new InvalidExpenseException("Amount should be greater than 0");
+        if (exactAmounts == null || exactAmounts.isEmpty()) throw new InvalidExpenseException("Exact amounts cannot be empty");
+        if (!users.containsKey(paidBy)) throw new UserNotFoundException(paidBy);
+        for (String userId : exactAmounts.keySet()) {
+            if (!users.containsKey(userId)) throw new UserNotFoundException(userId);
+        }
+        
+        double sum = exactAmounts.values().stream().mapToDouble(Double::doubleValue).sum();
+        if (Math.abs(totalAmount - sum) > 0.01) throw new InvalidExpenseException("Sum of exact amounts must equal total amount");
+        
+        String expenseId = "EXP_" + (++expenseCounter);
+        Expense expense = new Expense(expenseId, description, totalAmount, paidBy, new HashMap<>(exactAmounts), SplitType.EXACT);
+        expenses.put(expenseId, expense);
+        
+        for (Map.Entry<String, Double> entry : exactAmounts.entrySet()) {
+            if (entry.getKey().equals(paidBy)) continue;
+            updateBalance(paidBy, entry.getKey(), entry.getValue());
+        }
+        return expenseId;
     }
     
     /**
      * Create expense with PERCENTAGE split
-     * 
-     * IMPLEMENTATION HINTS:
-     * 1. Validate all users exist
-     * 2. Validate percentages sum to 100 (with epsilon)
-     * 3. Calculate amounts: totalAmount * (percentage / 100.0)
-     * 4. Create splits map and update balances
-     * 
-     * @param description Expense description
-     * @param totalAmount Total expense amount
-     * @param paidBy User who paid
-     * @param percentages Map of userId -> percentage they owe
-     * @return Generated expense ID
-     * @throws UserNotFoundException if any user doesn't exist
-     * @throws InvalidExpenseException if percentages don't sum to 100
      */
     public String addPercentageExpense(String description, double totalAmount, 
                                        String paidBy, Map<String, Double> percentages) 
             throws UserNotFoundException, InvalidExpenseException {
-        // TODO: Implement
-        // HINT: Validate percentages sum to 100.0 (with epsilon)
-        // HINT: For each user: amount = totalAmount * (percentage / 100.0)
-        return null;
+        if (totalAmount <= 0) throw new InvalidExpenseException("Amount should be greater than 0");
+        if (percentages == null || percentages.isEmpty()) throw new InvalidExpenseException("Percentages cannot be empty");
+        if (!users.containsKey(paidBy)) throw new UserNotFoundException(paidBy);
+        for (String userId : percentages.keySet()) {
+            if (!users.containsKey(userId)) throw new UserNotFoundException(userId);
+        }
+        
+        double percentageSum = percentages.values().stream().mapToDouble(Double::doubleValue).sum();
+        if (Math.abs(percentageSum - 100.0) > 0.01) throw new InvalidExpenseException("Percentages must sum to 100");
+        
+        Map<String, Double> splits = new HashMap<>();
+        for (Map.Entry<String, Double> entry : percentages.entrySet()) {
+            splits.put(entry.getKey(), totalAmount * entry.getValue() / 100.0);
+        }
+        
+        String expenseId = "EXP_" + (++expenseCounter);
+        Expense expense = new Expense(expenseId, description, totalAmount, paidBy, splits, SplitType.PERCENTAGE);
+        expenses.put(expenseId, expense);
+        
+        for (Map.Entry<String, Double> entry : splits.entrySet()) {
+            if (entry.getKey().equals(paidBy)) continue;
+            updateBalance(paidBy, entry.getKey(), entry.getValue());
+        }
+        return expenseId;
     }
     
     /**
      * Update balances between two users
-     * 
-     * IMPLEMENTATION HINTS:
-     * 1. Get or create balance entry for lender -> borrower
-     * 2. Add amount to existing balance
-     * 3. Also update reverse entry (borrower -> lender) with negative amount
-     * 4. Handle case where balance becomes zero
-     * 
-     * @param lender User who is owed money
-     * @param borrower User who owes money
-     * @param amount Amount owed
+     * lender paid, borrower owes
      */
     private void updateBalance(String lender, String borrower, double amount) {
-        // TODO: Implement
-        // HINT: balances.get(lender).put(borrower, currentBalance + amount);
-        // HINT: balances.get(borrower).put(lender, -(currentBalance + amount));
-        // HINT: Remove entry if balance becomes 0 (Math.abs(balance) < 0.01)
+        Map<String, Double> lenderBalances = balances.get(lender);
+        Map<String, Double> borrowerBalances = balances.get(borrower);
+
+        double newLenderBal = lenderBalances.getOrDefault(borrower, 0.0) + amount;
+        double newBorrowerBal = borrowerBalances.getOrDefault(lender, 0.0) - amount;
+
+        if (Math.abs(newLenderBal) < 0.01) {
+            lenderBalances.remove(borrower);
+            borrowerBalances.remove(lender);
+        } else {
+            lenderBalances.put(borrower, newLenderBal);
+            borrowerBalances.put(lender, newBorrowerBal);
+        }
     }
     
     /**
      * Settle up debt between two users
-     * 
-     * IMPLEMENTATION HINTS:
-     * 1. Validate both users exist
-     * 2. Get current balance between users
-     * 3. Validate amount <= what is owed
-     * 4. Update balances by subtracting settlement amount
-     * 5. Record settlement as special expense (optional)
-     * 
-     * @param payer User making payment
-     * @param receiver User receiving payment
-     * @param amount Settlement amount
-     * @throws UserNotFoundException if user doesn't exist
-     * @throws InvalidSettlementException if amount invalid
      */
     public void settleUp(String payer, String receiver, double amount) 
             throws UserNotFoundException, InvalidSettlementException {
-        // TODO: Implement
-        // HINT: Check users exist
-        // HINT: Get current owed amount
-        // HINT: Validate amount <= owed (with epsilon)
-        // HINT: Update balances: reduce debt by amount
+        if (!users.containsKey(payer)) throw new UserNotFoundException(payer);
+        if (!users.containsKey(receiver)) throw new UserNotFoundException(receiver);
+        if (amount <= 0) throw new InvalidSettlementException("Settlement amount must be positive");
+        
+        // payer owes receiver, so payer's balance for receiver is negative
+        double currentOwed = balances.get(payer).getOrDefault(receiver, 0.0);
+        double debt = -currentOwed;  // how much payer owes receiver (positive)
+        
+        if (debt < 0.01) throw new InvalidSettlementException("No debt to settle");
+        if (amount - debt > 0.01) throw new InvalidSettlementException("Settlement amount exceeds owed debt");
+        
+        // Reduce debt: receiver is lender, payer is borrower, negative amount to reduce
+        updateBalance(receiver, payer, -amount);
     }
     
     /**
-     * Get balance for a specific user (what they owe and are owed)
-     * 
-     * IMPLEMENTATION HINTS:
-     * 1. Validate user exists
-     * 2. Get user's balance map
-     * 3. Return copy to prevent external modification
-     * 
-     * @param userId User to get balances for
-     * @return Map of userId -> amount (positive = they owe you, negative = you owe them)
-     * @throws UserNotFoundException if user doesn't exist
+     * Get balance for a specific user
      */
     public Map<String, Double> getUserBalance(String userId) throws UserNotFoundException {
-        // TODO: Implement
-        // HINT: Return new HashMap<>(balances.get(userId)) for safety
-        return null;
+        if (!users.containsKey(userId)) throw new UserNotFoundException(userId);
+        return new HashMap<>(balances.get(userId));
     }
     
     /**
      * Get all balances in the system
-     * 
-     * IMPLEMENTATION HINTS:
-     * 1. Iterate through all users' balances
-     * 2. Only include non-zero balances
-     * 3. Format for easy reading
-     * 
-     * @return List of balance strings
      */
     public List<String> getBalanceSheet() {
-        // TODO: Implement
-        // HINT: For each user, iterate their balances
-        // HINT: Skip if balance is ~0 (Math.abs(amount) < 0.01)
-        // HINT: Format: "User1 owes User2: $50.00"
-        return null;
+        List<String> sheet = new ArrayList<>();
+        for (Map.Entry<String, Map<String, Double>> userEntry : balances.entrySet()) {
+            String userId = userEntry.getKey();
+            String userName = users.get(userId).getName();
+            for (Map.Entry<String, Double> balEntry : userEntry.getValue().entrySet()) {
+                double amount = balEntry.getValue();
+                if (Math.abs(amount) < 0.01) continue;
+                String otherName = users.get(balEntry.getKey()).getName();
+                if (amount < 0) {
+                    // userId owes otherUser
+                    sheet.add(userName + " owes " + otherName + ": $" + String.format("%.2f", Math.abs(amount)));
+                }
+            }
+        }
+        if (sheet.isEmpty()) sheet.add("No balances");
+        return sheet;
     }
     
     /**
      * Get all expenses involving a user
-     * 
-     * IMPLEMENTATION HINTS:
-     * 1. Validate user exists
-     * 2. Iterate through all expenses
-     * 3. Check if user is paidBy or in splits
-     * 4. Return list of matching expenses
-     * 
-     * @param userId User to get expenses for
-     * @return List of expenses
-     * @throws UserNotFoundException if user doesn't exist
      */
     public List<Expense> getUserExpenses(String userId) throws UserNotFoundException {
-        // TODO: Implement
-        // HINT: Check expenses where paidBy == userId OR splits.containsKey(userId)
-        return null;
+        if (!users.containsKey(userId)) throw new UserNotFoundException(userId);
+        return expenses.values().stream()
+            .filter(e -> e.getPaidBy().equals(userId) || e.getSplits().containsKey(userId))
+            .collect(Collectors.toList());
     }
     
     /**
-     * Get total amount user has spent (paid for others)
-     * 
-     * IMPLEMENTATION HINTS:
-     * 1. Sum up positive balances (what others owe this user)
-     * 2. This represents money they paid that hasn't been settled
-     * 
-     * @param userId User to calculate for
-     * @return Total amount spent for others
-     * @throws UserNotFoundException if user doesn't exist
+     * Get total amount user has lent (positive balances = others owe them)
      */
     public double getTotalSpent(String userId) throws UserNotFoundException {
-        // TODO: Implement
-        // HINT: Sum all positive values in balances.get(userId).values()
-        return 0.0;
+        if (!users.containsKey(userId)) throw new UserNotFoundException(userId);
+        return balances.get(userId).values().stream()
+            .filter(v -> v > 0)
+            .mapToDouble(Double::doubleValue)
+            .sum();
     }
     
     /**
-     * Get total amount user owes to others
-     * 
-     * IMPLEMENTATION HINTS:
-     * 1. Sum up negative balances (what this user owes others)
-     * 2. Return absolute value
-     * 
-     * @param userId User to calculate for
-     * @return Total amount owed
-     * @throws UserNotFoundException if user doesn't exist
+     * Get total amount user owes to others (absolute of negative balances)
      */
     public double getTotalOwed(String userId) throws UserNotFoundException {
-        // TODO: Implement
-        // HINT: Sum all negative values in balances.get(userId).values()
-        // HINT: Return Math.abs(sum)
-        return 0.0;
+        if (!users.containsKey(userId)) throw new UserNotFoundException(userId);
+        return Math.abs(balances.get(userId).values().stream()
+            .filter(v -> v < 0)
+            .mapToDouble(Double::doubleValue)
+            .sum());
     }
     
     /**
-     * Get net balance for user (positive = owed to them, negative = they owe)
-     * 
-     * @param userId User to calculate for
-     * @return Net balance
-     * @throws UserNotFoundException if user doesn't exist
+     * Get net balance for user
      */
     public double getNetBalance(String userId) throws UserNotFoundException {
-        // TODO: Implement
-        // HINT: Sum all values in balances.get(userId).values()
-        return 0.0;
+        if (!users.containsKey(userId)) throw new UserNotFoundException(userId);
+        return balances.get(userId).values().stream()
+            .mapToDouble(Double::doubleValue)
+            .sum();
     }
     
     /**
      * Get expense by ID
-     * 
-     * @param expenseId Expense ID
-     * @return Expense object
-     * @throws ExpenseNotFoundException if expense doesn't exist
      */
     public Expense getExpense(String expenseId) throws ExpenseNotFoundException {
-        // TODO: Implement
-        // HINT: Check if expenses.containsKey(expenseId)
-        return null;
+        Expense expense = expenses.get(expenseId);
+        if (expense == null) throw new ExpenseNotFoundException(expenseId);
+        return expense;
     }
     
     /**
-     * BONUS: Simplify debts using graph algorithms
-     * Minimize number of transactions needed to settle all debts
-     * 
-     * IMPLEMENTATION HINTS:
-     * 1. Calculate net balance for each user
-     * 2. Separate into creditors (net positive) and debtors (net negative)
-     * 3. Match largest creditor with largest debtor
-     * 4. Continue until all debts settled
-     * 
-     * @return List of optimal transactions to settle all debts
+     * BONUS: Simplify debts - minimize number of transactions
      */
     public List<String> simplifyDebts() {
-        // TODO: Implement (BONUS)
-        // HINT: Use greedy approach - match highest debt with highest credit
-        // HINT: This is similar to minimum cash flow problem
-        return new ArrayList<>();
-    }
-    
-    /**
-     * Generate unique expense ID
-     * 
-     * @return Unique expense ID
-     */
-    private String generateExpenseId() {
-        return "EXP" + (++expenseCounter);
+        // Calculate net balance for each user
+        Map<String, Double> netBalances = new HashMap<>();
+        for (Map.Entry<String, Map<String, Double>> entry : balances.entrySet()) {
+            double net = entry.getValue().values().stream().mapToDouble(Double::doubleValue).sum();
+            if (Math.abs(net) > 0.01) {
+                netBalances.put(entry.getKey(), net);
+            }
+        }
+        
+        // Separate creditors (positive) and debtors (negative)
+        List<Map.Entry<String, Double>> creditors = netBalances.entrySet().stream()
+            .filter(e -> e.getValue() > 0.01)
+            .sorted((a, b) -> Double.compare(b.getValue(), a.getValue()))
+            .collect(Collectors.toList());
+        
+        List<Map.Entry<String, Double>> debtors = netBalances.entrySet().stream()
+            .filter(e -> e.getValue() < -0.01)
+            .sorted(Comparator.comparingDouble(e -> e.getValue()))
+            .collect(Collectors.toList());
+        
+        List<String> transactions = new ArrayList<>();
+        int i = 0, j = 0;
+        while (i < debtors.size() && j < creditors.size()) {
+            double debt = Math.abs(debtors.get(i).getValue());
+            double credit = creditors.get(j).getValue();
+            double settle = Math.min(debt, credit);
+            
+            String debtorName = users.get(debtors.get(i).getKey()).getName();
+            String creditorName = users.get(creditors.get(j).getKey()).getName();
+            transactions.add(debtorName + " pays " + creditorName + ": $" + String.format("%.2f", settle));
+            
+            debtors.get(i).setValue(debtors.get(i).getValue() + settle);
+            creditors.get(j).setValue(creditors.get(j).getValue() - settle);
+            
+            if (Math.abs(debtors.get(i).getValue()) < 0.01) i++;
+            if (Math.abs(creditors.get(j).getValue()) < 0.01) j++;
+        }
+        
+        if (transactions.isEmpty()) transactions.add("All settled up!");
+        return transactions;
     }
     
     // ===== TEST DRIVER =====
@@ -526,7 +419,7 @@ public class SplitwiseSystem {
         try {
             List<String> balances = splitwise.getBalanceSheet();
             for (String balance : balances) {
-                System.out.println(balance);
+                System.out.println("  " + balance);
             }
         } catch (Exception e) {
             System.out.println("✗ Error: " + e.getMessage());
@@ -578,7 +471,7 @@ public class SplitwiseSystem {
         try {
             List<String> balances = splitwise.getBalanceSheet();
             for (String balance : balances) {
-                System.out.println(balance);
+                System.out.println("  " + balance);
             }
         } catch (Exception e) {
             System.out.println("✗ Error: " + e.getMessage());
@@ -588,8 +481,8 @@ public class SplitwiseSystem {
         // Test Case 7: Settle Up
         System.out.println("=== Test Case 7: Settle Up Payment ===");
         try {
-            splitwise.settleUp("U2", "U1", 100.0);
-            System.out.println("✓ U2 paid U1: $100.00");
+            splitwise.settleUp("U2", "U1", 50.0);
+            System.out.println("✓ U2 paid U1: $50.00");
         } catch (Exception e) {
             System.out.println("✗ Error: " + e.getMessage());
         }
@@ -602,8 +495,9 @@ public class SplitwiseSystem {
             System.out.println("Alice's balances:");
             for (Map.Entry<String, Double> entry : userBalance.entrySet()) {
                 double amount = entry.getValue();
+                String otherName = entry.getKey();
                 String relation = amount > 0 ? "owes Alice" : "is owed by Alice";
-                System.out.println("  " + entry.getKey() + " " + relation + ": $" + 
+                System.out.println("  " + otherName + " " + relation + ": $" + 
                                    String.format("%.2f", Math.abs(amount)));
             }
         } catch (Exception e) {
@@ -627,8 +521,16 @@ public class SplitwiseSystem {
         }
         System.out.println();
         
-        // Test Case 10: Exception - Duplicate User
-        System.out.println("=== Test Case 10: Exception - Duplicate User ===");
+        // Test Case 10: Simplify Debts
+        System.out.println("=== Test Case 10: Simplify Debts ===");
+        List<String> simplified = splitwise.simplifyDebts();
+        for (String txn : simplified) {
+            System.out.println("  " + txn);
+        }
+        System.out.println();
+        
+        // Test Case 11: Exception - Duplicate User
+        System.out.println("=== Test Case 11: Exception - Duplicate User ===");
         try {
             splitwise.addUser("U1", "Alice Clone", "alice2@example.com");
             System.out.println("✗ Should have thrown UserAlreadyExistsException");
@@ -639,8 +541,8 @@ public class SplitwiseSystem {
         }
         System.out.println();
         
-        // Test Case 11: Exception - User Not Found
-        System.out.println("=== Test Case 11: Exception - User Not Found ===");
+        // Test Case 12: Exception - User Not Found
+        System.out.println("=== Test Case 12: Exception - User Not Found ===");
         try {
             splitwise.addEqualExpense("Test", 100.0, "U999", Arrays.asList("U1", "U2"));
             System.out.println("✗ Should have thrown UserNotFoundException");
@@ -651,8 +553,8 @@ public class SplitwiseSystem {
         }
         System.out.println();
         
-        // Test Case 12: Exception - Invalid Expense
-        System.out.println("=== Test Case 12: Exception - Invalid Expense Amount ===");
+        // Test Case 13: Exception - Invalid Expense
+        System.out.println("=== Test Case 13: Exception - Invalid Expense Amount ===");
         try {
             splitwise.addEqualExpense("Invalid", -100.0, "U1", Arrays.asList("U1", "U2"));
             System.out.println("✗ Should have thrown InvalidExpenseException");
@@ -663,76 +565,28 @@ public class SplitwiseSystem {
         }
         System.out.println();
         
-        System.out.println("=== All Test Cases Complete! ===");
+        // Test Case 14: Get Expense
+        System.out.println("=== Test Case 14: Get Expense ===");
+        try {
+            Expense exp = splitwise.getExpense("EXP_1");
+            System.out.println("✓ Expense: " + exp.getDescription() + " ($" + String.format("%.2f", exp.getTotalAmount()) + ")");
+        } catch (Exception e) {
+            System.out.println("✗ Error: " + e.getMessage());
+        }
+        System.out.println();
+        
+        // Test Case 15: Get User Expenses
+        System.out.println("=== Test Case 15: User Expenses ===");
+        try {
+            List<Expense> userExpenses = splitwise.getUserExpenses("U1");
+            System.out.println("Alice's expenses: " + userExpenses.size());
+            for (Expense e : userExpenses) {
+                System.out.println("  " + e.getDescription() + " ($" + String.format("%.2f", e.getTotalAmount()) + ", " + e.getSplitType() + ")");
+            }
+        } catch (Exception e) {
+            System.out.println("✗ Error: " + e.getMessage());
+        }
+        
+        System.out.println("\n=== All Test Cases Complete! ===");
     }
 }
-
-/**
- * INTERVIEW DISCUSSION TOPICS:
- * ============================
- * 
- * 1. DATA STRUCTURES:
- *    - HashMap for O(1) user and expense lookups
- *    - Nested HashMap for balance tracking: Map<userId, Map<userId, amount>>
- *    - Why not use a 2D array? (Sparse matrix, dynamic user addition)
- * 
- * 2. BALANCE TRACKING STRATEGY:
- *    - Store pairwise balances (redundant but faster lookups)
- *    - Alternative: Store net balances only (less storage, more calculation)
- *    - Trade-off: Space vs. computation complexity
- * 
- * 3. FLOATING POINT PRECISION:
- *    - Use epsilon (0.01) for equality comparisons
- *    - Alternative: Use BigDecimal for financial calculations
- *    - Or: Store amounts in cents (integers) to avoid floating point issues
- * 
- * 4. DEBT SIMPLIFICATION:
- *    - Minimum Cash Flow problem (NP-hard)
- *    - Greedy approach: Match highest creditor with highest debtor
- *    - Graph representation: Directed weighted graph
- *    - Algorithm: Similar to max-flow min-cut
- * 
- * 5. SCALABILITY:
- *    - Database: SQL for consistency (ACID properties)
- *    - Caching: Redis for balance lookups
- *    - Sharding: Partition by userId
- *    - Event sourcing: Store all transactions, calculate balances on-demand
- * 
- * 6. ADVANCED FEATURES:
- *    - Multi-currency support (exchange rates, base currency)
- *    - Recurring expenses (subscriptions)
- *    - Groups/Trips (aggregate multiple users)
- *    - Expense categories and analytics
- *    - Notifications (reminders for pending payments)
- *    - Payment integrations (Venmo, PayPal)
- * 
- * 7. CONCURRENCY:
- *    - Handle simultaneous expense additions
- *    - Use optimistic locking or versioning
- *    - Transaction isolation levels
- *    - Eventual consistency for balance calculations
- * 
- * 8. SYSTEM DESIGN COMPONENTS:
- *    - API Gateway / Load Balancer
- *    - Application Servers (REST APIs)
- *    - Database (PostgreSQL/MySQL for ACID)
- *    - Cache Layer (Redis for hot data)
- *    - Message Queue (Kafka for async processing)
- *    - Notification Service
- * 
- * 9. API DESIGN:
- *    POST   /users                    - Add user
- *    GET    /users/{id}               - Get user
- *    POST   /expenses                 - Create expense
- *    GET    /expenses/{id}            - Get expense
- *    GET    /users/{id}/balance       - Get user balance
- *    POST   /settlements              - Settle debt
- *    GET    /users/{id}/expenses      - Get user expenses
- *    GET    /balances                 - Get all balances
- * 
- * 10. DESIGN PATTERNS:
- *     - Strategy Pattern: Different split strategies (Equal, Exact, Percentage)
- *     - Factory Pattern: Expense creation
- *     - Observer Pattern: Notify users of expense updates
- *     - Repository Pattern: Data access abstraction
- */

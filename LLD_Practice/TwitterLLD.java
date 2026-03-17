@@ -3,14 +3,7 @@ import java.util.*;
 
 // ===== CUSTOM EXCEPTION CLASSES =====
 
-class UserNotFoundException extends Exception {
-    private String userId;
-    public UserNotFoundException(String userId) {
-        super("User not found: " + userId);
-        this.userId = userId;
-    }
-    public String getUserId() { return userId; }
-}
+
 
 class UserAlreadyExistsException extends Exception {
     private String userId;

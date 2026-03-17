@@ -163,8 +163,6 @@ public class TinyURLSystem {
     private static final int SHORT_CODE_LENGTH = 6;
     private static final String CHARACTERS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     private static final int MAX_RETRIES = 10;
-    private static final Long DEFAULT_EXPIRATION = 10000000000L;
-
     
     // HINT 5: For generating unique codes
     private Random random;
@@ -174,7 +172,6 @@ public class TinyURLSystem {
      * HINT: What data structures need initialization?
      */
     public TinyURLSystem() {
-        // TODO: Initialize maps and random generator
         shortToLongMap = new HashMap<>();
         longToShortMap = new HashMap<>();
         expirationMap = new HashMap<>();

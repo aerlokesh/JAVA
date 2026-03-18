@@ -143,7 +143,6 @@ class TokenBucketRateLimiter implements RateLimiter {
      */
     @Override
     public synchronized boolean allowRequest(String clientId) {
-        // TODO: Implement
         // HINT: long now = System.nanoTime();
         // HINT: double[] bucket = buckets.computeIfAbsent(clientId, 
         //           k -> new double[]{capacity, now});
@@ -152,6 +151,8 @@ class TokenBucketRateLimiter implements RateLimiter {
         // HINT: bucket[1] = now;
         // HINT: if (bucket[0] >= 1) { bucket[0] -= 1; return true; }
         // HINT: return false;
+        long now=System.nanoTime();
+        double[] bucket = buckets.computeIfAbsent(clientId, k->new double[]{capacity,now});
         return false;
     }
     

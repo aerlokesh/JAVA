@@ -1,6 +1,7 @@
 import java.time.*;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
 
 // ===== CUSTOM EXCEPTION CLASSES =====
 
@@ -70,7 +71,7 @@ enum NotificationStatus {
  * Strategy interface for different notification channels
  */
 interface NotificationSender {
-    boolean send(String userId, String message);
+    boolean     send(String userId, String message);
     NotificationChannel getChannel();
 }
 
@@ -86,11 +87,11 @@ class EmailSender implements NotificationSender {
      */
     @Override
     public boolean send(String userId, String message) {
-        // TODO: Implement
         // HINT: System.out.println("    📧 EMAIL → " + userId + ": " + message);
         // HINT: Simulate network call with success/failure
         // HINT: return true; (for now, always succeed)
-        return false;
+        System.out.println("    📧 EMAIL → " + userId + ": " + message);
+        return true;
     }
     
     @Override
@@ -107,10 +108,10 @@ class SmsSender implements NotificationSender {
      */
     @Override
     public boolean send(String userId, String message) {
-        // TODO: Implement
         // HINT: System.out.println("    📱 SMS → " + userId + ": " + message);
         // HINT: return true;
-        return false;
+        System.out.println("    📱 SMS → " + userId + ": " + message);
+        return true;
     }
     
     @Override
@@ -127,10 +128,10 @@ class PushSender implements NotificationSender {
      */
     @Override
     public boolean send(String userId, String message) {
-        // TODO: Implement
         // HINT: System.out.println("    🔔 PUSH → " + userId + ": " + message);
         // HINT: return true;
-        return false;
+        System.out.println("    🔔 PUSH → " + userId + ": " + message);
+        return true;
     }
     
     @Override
@@ -232,9 +233,10 @@ class NotificationService {
      * @param sender Implementation for this channel
      */
     public void registerSender(NotificationChannel channel, NotificationSender sender) {
-        // TODO: Implement
         // HINT: senders.put(channel, sender);
         // HINT: System.out.println("Registered: " + channel + " sender");
+        senders.put(channel, sender);
+        System.out.println("Registered: " + channel + " sender");
     }
     
     /**
@@ -243,8 +245,8 @@ class NotificationService {
      * @param preference User's channel preferences
      */
     public void setUserPreference(UserPreference preference) {
-        // TODO: Implement
         // HINT: userPreferences.put(preference.userId, preference);
+        userPreferences.put(preference.userId, preference);
     }
     
     /**
@@ -277,7 +279,6 @@ class NotificationService {
      */
     public synchronized Notification sendNotification(String userId, String message,
             NotificationChannel channel, NotificationPriority priority) throws InvalidChannelException {
-        // TODO: Implement
         // HINT: Notification notif = new Notification(userId, message, channel, priority);
         // HINT: UserPreference pref = userPreferences.get(userId);
         // HINT: if (pref != null && !pref.isChannelEnabled(channel)) 
@@ -300,7 +301,27 @@ class NotificationService {
         // }
         // HINT: allNotifications.add(notif);
         // HINT: return notif;
-        return null;
+        Notification notif = new Notification(userId, message, channel, priority);
+        UserPreference pref = userPreferences.get(userId);
+        if(pref!=null && !pref.isChannelEnabled(channel)) throw new InvalidChannelException(channel, message);
+        NotificationSender sender = senders.get(channel);
+        for (int i = 0; i <= maxRetries; i++) {
+            if(sender.send(userId, message)){
+                notif.status=NotificationStatus.SENT;
+                notif.sentAt=LocalDateTime.now();
+                totalSent.incrementAndGet();
+                break;
+            }else{
+                notif.retryCount++;
+                notif.status=NotificationStatus.RETRYING;
+            }
+        }
+        if(notif.status!=NotificationStatus.SENT){
+            notif.status=NotificationStatus.FAILED;
+            totalFailed.incrementAndGet();
+        }
+        allNotifications.add(notif);
+        return notif;
     }
     
     /**
@@ -320,7 +341,6 @@ class NotificationService {
      * @return List of notifications (one per channel)
      */
     public List<Notification> broadcastToUser(String userId, String message, NotificationPriority priority) {
-        // TODO: Implement
         // HINT: List<Notification> notifications = new ArrayList<>();
         // HINT: UserPreference pref = userPreferences.get(userId);
         // HINT: Set<NotificationChannel> channels = (pref != null) ? pref.enabledChannels : new HashSet<>(senders.keySet());
@@ -331,7 +351,18 @@ class NotificationService {
         //     } catch (InvalidChannelException e) { /* skip disabled channel */ }
         // }
         // HINT: return notifications;
-        return new ArrayList<>();
+        List<Notification> notifications=new ArrayList<>();
+        UserPreference userPreference=userPreferences.get(userId);
+        Set<NotificationChannel> channels = (userPreference!=null)?userPreference.enabledChannels:new HashSet<>(senders.keySet());
+        for(NotificationChannel channel:channels){
+            try {
+                Notification notification=sendNotification(userId, message, channel, priority);
+                notifications.add(notification);
+            } catch (InvalidChannelException e) {
+
+            }
+        }
+        return notifications;
     }
     
     /**
@@ -351,7 +382,6 @@ class NotificationService {
      */
     public List<Notification> bulkSend(List<String> userIds, String message,
             NotificationChannel channel, NotificationPriority priority) {
-        // TODO: Implement
         // HINT: List<Notification> results = new ArrayList<>();
         // HINT: for (String userId : userIds) {
         //     try {
@@ -360,7 +390,16 @@ class NotificationService {
         //     } catch (InvalidChannelException e) { /* add failed notification */ }
         // }
         // HINT: return results;
-        return new ArrayList<>();
+        List<Notification> results=new ArrayList<>();
+        for(String userId:userIds){
+            try{
+                Notification notification=sendNotification(userId, message, channel, priority);
+                results.add(notification);
+            }catch(InvalidChannelException e){
+
+            }
+        }
+        return results;
     }
     
     /**
@@ -370,11 +409,10 @@ class NotificationService {
      * @return List of user's notifications
      */
     public List<Notification> getUserNotifications(String userId) {
-        // TODO: Implement
         // HINT: return allNotifications.stream()
         //     .filter(n -> n.userId.equals(userId))
         //     .collect(Collectors.toList());
-        return new ArrayList<>();
+        return allNotifications.stream().filter(x->x.userId.equals(userId)).collect(Collectors.toList());
     }
     
     /**
@@ -384,11 +422,10 @@ class NotificationService {
      * @return List of notifications with that status
      */
     public List<Notification> getNotificationsByStatus(NotificationStatus status) {
-        // TODO: Implement
         // HINT: return allNotifications.stream()
         //     .filter(n -> n.status == status)
         //     .collect(Collectors.toList());
-        return new ArrayList<>();
+        return allNotifications.stream().filter(x->x.status==status).collect(Collectors.toList());
     }
     
     /**

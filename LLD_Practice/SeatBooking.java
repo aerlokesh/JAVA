@@ -1,6 +1,7 @@
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.locks.*;
+import java.util.stream.*;
 
 // ===== CUSTOM EXCEPTION CLASSES =====
 
@@ -145,8 +146,30 @@ class Seat {
  * - Discuss idempotency for booking APIs
  */
 class BookingSystem {
+    // Reservation timeout as a constant: all reservations expire after this many seconds.
+    // In production this would typically be 300-600 seconds (5-10 minutes) for payment.
+    // Using a constant ensures consistent behavior across the system and prevents
+    // callers from setting unreasonable timeouts (e.g., 1 year).
+    // static = belongs to the class, not an instance. final = cannot be changed after init.
+    // NOTE: Set to 2 seconds for testing. In production, use 300 (5 min) or 600 (10 min).
+    private static final int RESERVATION_TIMEOUT_SECONDS = 2;
+
+    // ConcurrentHashMap = thread-safe HashMap. Multiple threads can read/write
+    // without corrupting data. Uses internal segmented locking (not one big lock).
+    // Why not HashMap? HashMap is NOT thread-safe - concurrent writes can corrupt it.
     private final ConcurrentHashMap<String, Seat> seats;
+    
+    // Per-seat locks: Instead of locking the ENTIRE system when someone books,
+    // we lock only the specific seat. This means booking seat A1 won't block booking B1.
+    // This is called "fine-grained locking" vs "coarse-grained locking" (one lock for all).
     private final ConcurrentHashMap<String, Lock> seatLocks;
+    
+    // ScheduledExecutorService = a thread pool that can schedule tasks to run LATER.
+    // Think of it as a timer service with 2 worker threads.
+    // We use it to auto-expire reservations after a timeout.
+    // Example: "Run this cleanup task in 5 seconds"
+    // newScheduledThreadPool(2) = 2 threads handling scheduled tasks.
+    // Why 2? So if one expiration task is running, another can still execute.
     private final ScheduledExecutorService scheduler;
     
     public BookingSystem() {
@@ -163,11 +186,12 @@ class BookingSystem {
      * @return Seat ID
      */
     public String addSeat(String seatId, double basePrice) {
-        // TODO: Implement
         // HINT: Seat seat = new Seat(seatId, basePrice);
         // HINT: seats.put(seatId, seat);
         // HINT: return seatId;
-        return null;
+        Seat seat=new Seat(seatId, basePrice);
+        seats.put(seatId, seat);
+        return seatId;
     }
     
     /**
@@ -192,15 +216,13 @@ class BookingSystem {
      * 
      * @param seatId Seat to reserve
      * @param userId User making reservation
-     * @param timeoutSeconds Reservation expires after this
      * @param pricing Pricing strategy to apply
      * @return true if reserved successfully
      * @throws SeatNotFoundException if seat doesn't exist
      * @throws SeatAlreadyBookedException if seat not available
      */
-    public boolean reserveSeat(String seatId, String userId, int timeoutSeconds, PricingStrategy pricing) 
+    public boolean reserveSeat(String seatId, String userId, PricingStrategy pricing) 
             throws SeatNotFoundException, SeatAlreadyBookedException, InterruptedException {
-        // TODO: Implement
         // HINT: Seat seat = seats.get(seatId);
         // HINT: if (seat == null) throw new SeatNotFoundException(seatId);
         // HINT: Lock lock = seatLocks.computeIfAbsent(seatId, k -> new ReentrantLock());
@@ -217,7 +239,48 @@ class BookingSystem {
         //     double price = pricing.calculate(seat.getBasePrice());
         //     return true;
         // } finally { lock.unlock(); }
-        return false;
+        // Step 1: Look up the seat from our ConcurrentHashMap
+        Seat seat=seats.get(seatId);
+        if(seat==null) throw new SeatNotFoundException(seatId);
+
+        // Step 2: Get or create a ReentrantLock for THIS specific seat.
+        // computeIfAbsent = "if no lock exists for this seatId, create a new ReentrantLock"
+        // ReentrantLock = a lock that the same thread can acquire multiple times (re-entrant).
+        // Why per-seat? So booking A1 doesn't block someone booking B1 (fine-grained locking).
+        Lock lock=seatLocks.computeIfAbsent(seatId, k->new ReentrantLock());
+
+        // Step 3: tryLock(1, SECONDS) = "try to acquire lock, wait up to 1 second"
+        // Returns false if another thread already holds this lock (someone else is booking same seat)
+        // Why tryLock instead of lock()? lock() blocks forever. tryLock lets us fail fast
+        // and tell the user "someone else is booking this seat right now".
+        // IMPORTANT: !lock.tryLock = if we FAILED to get the lock, throw exception
+        if(!lock.tryLock(1,TimeUnit.SECONDS)) throw new SeatAlreadyBookedException(seatId, null);
+        try {
+            // Step 4: "Lazy expiration" - if the previous reservation expired, free the seat
+            // This handles the edge case where the scheduled cleanup hasn't run yet
+            if(seat.isReservationExpired()) seat.setStatus(SeatStatus.AVAILABLE);
+
+            // Step 5: Double-check the seat is actually available
+            if(seat.getStatus()!=SeatStatus.AVAILABLE) throw new SeatAlreadyBookedException(seatId, seat.getStatus());
+
+            // Step 6: Reserve the seat - set status, who reserved it, and when it expires
+            seat.setStatus(SeatStatus.RESERVED);
+            seat.setReservedBy(userId);
+            // Expiry = current time + RESERVATION_TIMEOUT_SECONDS converted to milliseconds
+            seat.setReservationExpiry(System.currentTimeMillis() + RESERVATION_TIMEOUT_SECONDS * 1000L);
+
+            // Step 7: Schedule a background task to auto-free this seat after the constant timeout
+            scheduleExpiration(seatId, RESERVATION_TIMEOUT_SECONDS);
+
+            // Step 8: Calculate the price using the Strategy Pattern
+            // e.g., PremiumPricing.calculate(10.0) = 20.0, WeekendPricing = 15.0
+            double price = pricing.calculate(seat.getBasePrice());
+            return true;
+        } finally {
+            // CRITICAL: Always unlock in finally block! If we don't, the seat is locked forever.
+            // finally runs whether the try block succeeds or throws an exception.
+            lock.unlock();
+        }
     }
     
     /**
@@ -240,13 +303,44 @@ class BookingSystem {
      */
     public boolean confirmBooking(String seatId, String userId) 
             throws SeatNotFoundException, InvalidBookingException, InterruptedException {
-        // TODO: Implement
         // HINT: Get seat, acquire lock
         // HINT: Check seat.getStatus() == SeatStatus.RESERVED
         // HINT: Check !seat.isReservationExpired()
         // HINT: Check seat.getReservedBy().equals(userId)
         // HINT: seat.setStatus(SeatStatus.BOOKED);
-        return false;
+        // Step 1: Validate seat exists
+        Seat seat=seats.get(seatId);
+        if(seat==null) throw new SeatNotFoundException(seatId);
+
+        // Step 2: Acquire the per-seat lock (same pattern as reserveSeat)
+        Lock lock=seatLocks.computeIfAbsent(seatId, k->new ReentrantLock());
+        if(!lock.tryLock(1, TimeUnit.SECONDS)) throw new InvalidBookingException("Invalid booking for seat " + seatId + ": could not acquire lock");
+        try {
+            // Step 3: Validate the seat is in RESERVED state (not AVAILABLE or BOOKED)
+            // You can only confirm something that was previously reserved
+            if(seat.getStatus() != SeatStatus.RESERVED)
+                throw new InvalidBookingException("Invalid booking for seat " + seatId + ": seat is not reserved, current status: " + seat.getStatus());
+
+            // Step 4: Check if the reservation timed out while the user was paying
+            // If expired, clean it up and reject the confirmation
+            if(seat.isReservationExpired()) {
+                seat.setStatus(SeatStatus.AVAILABLE);
+                seat.setReservedBy(null);
+                throw new InvalidBookingException("Invalid booking for seat " + seatId + ": reservation has expired");
+            }
+
+            // Step 5: Verify the person confirming is the same person who reserved
+            // Prevents user B from confirming user A's reservation
+            if(!seat.getReservedBy().equals(userId))
+                throw new InvalidBookingException("Invalid booking for seat " + seatId + ": userId mismatch, reserved by: " + seat.getReservedBy());
+
+            // Step 6: All checks passed! Transition: RESERVED -> BOOKED (permanent)
+            // BOOKED seats won't be auto-expired by the scheduler
+            seat.setStatus(SeatStatus.BOOKED);
+            return true;
+        } finally {
+            lock.unlock(); // Always release the lock
+        }
     }
     
     /**
@@ -261,9 +355,26 @@ class BookingSystem {
      * @throws SeatNotFoundException if seat doesn't exist
      */
     public boolean cancelSeat(String seatId) throws SeatNotFoundException, InterruptedException {
-        // TODO: Implement
-        // HINT: Acquire lock, check status, set to AVAILABLE
-        return false;
+        Seat seat = seats.get(seatId);
+        if(seat == null) throw new SeatNotFoundException(seatId);
+        Lock lock = seatLocks.computeIfAbsent(seatId, k -> new ReentrantLock());
+
+        // Using lock.lock() (blocking) instead of tryLock here because:
+        // Cancel is a definite user action - we WANT to wait until the lock is free
+        // rather than failing. The user has decided to cancel, so we should complete it.
+        lock.lock();
+        try {
+            // Only cancel if the seat is actually reserved or booked
+            // If it's already AVAILABLE, there's nothing to cancel
+            if(seat.getStatus() == SeatStatus.RESERVED || seat.getStatus() == SeatStatus.BOOKED) {
+                seat.setStatus(SeatStatus.AVAILABLE); // Free the seat
+                seat.setReservedBy(null);              // Clear the owner
+                return true;
+            }
+            return false; // already available, nothing to cancel
+        } finally {
+            lock.unlock();
+        }
     }
     
     /**
@@ -278,20 +389,31 @@ class BookingSystem {
      * @param delaySeconds Delay before expiration
      */
     private void scheduleExpiration(String seatId, int delaySeconds) {
-        // TODO: Implement
-        // HINT: scheduler.schedule(() -> {
-        //     Seat seat = seats.get(seatId);
-        //     Lock lock = seatLocks.get(seatId);
-        //     if (seat != null && lock != null) {
-        //         lock.lock();
-        //         try {
-        //             if (seat.isReservationExpired()) {
-        //                 seat.setStatus(SeatStatus.AVAILABLE);
-        //                 seat.setReservedBy(null);
-        //             }
-        //         } finally { lock.unlock(); }
-        //     }
-        // }, delaySeconds, TimeUnit.SECONDS);
+        // scheduler.schedule(task, delay, unit) = "run this task after 'delay' seconds"
+        // The lambda () -> { ... } is the task that runs on a scheduler thread pool thread.
+        // This is how we implement "if user doesn't pay in 5 minutes, free the seat".
+        //
+        // Flow: reserveSeat() -> scheduleExpiration(seatId, 5) -> after 5s, scheduler runs lambda
+        //       -> lambda checks if still expired -> if yes, frees the seat
+        scheduler.schedule(() -> {
+            Seat seat = seats.get(seatId);
+            Lock lock = seatLocks.get(seatId);
+            if (seat != null && lock != null) {
+                // Must acquire lock before modifying seat state!
+                // Another thread might be confirming this seat right now
+                lock.lock();
+                try {
+                    // isReservationExpired() checks: status==RESERVED AND currentTime > expiryTime
+                    // Why check again? The user might have confirmed (BOOKED) before this runs.
+                    // In that case isReservationExpired() returns false and we skip the cleanup.
+                    if (seat.isReservationExpired()) {
+                        seat.setStatus(SeatStatus.AVAILABLE);
+                        seat.setReservedBy(null);
+                        System.out.println("  [Auto-expired] Seat " + seatId + " released");
+                    }
+                } finally { lock.unlock(); }
+            }
+        }, delaySeconds, TimeUnit.SECONDS);
     }
     
     /**
@@ -300,12 +422,17 @@ class BookingSystem {
      * @return List of available seat IDs
      */
     public List<String> getAvailableSeats() {
-        // TODO: Implement
-        // HINT: return seats.values().stream()
-        //     .filter(s -> s.getStatus() == SeatStatus.AVAILABLE)
-        //     .map(Seat::getSeatId)
-        //     .collect(Collectors.toList());
-        return new ArrayList<>();
+        // Java Streams pipeline:
+        // seats.values()           -> get all Seat objects from the map
+        // .stream()                -> convert to a Stream (lazy processing pipeline)
+        // .filter(s -> ...)        -> keep only seats with status AVAILABLE
+        // .map(Seat::getSeatId)    -> transform each Seat object into just its seatId String
+        //                             (Seat::getSeatId is a method reference, same as s -> s.getSeatId())
+        // .collect(Collectors.toList()) -> gather all results into a List<String>
+        return seats.values().stream()
+            .filter(s -> s.getStatus() == SeatStatus.AVAILABLE)
+            .map(Seat::getSeatId)
+            .collect(Collectors.toList());
     }
     
     /**
@@ -348,7 +475,7 @@ public class SeatBooking {
         // Test Case 1: Reserve and Confirm
         System.out.println("\n=== Test Case 1: Reserve and Confirm ===");
         try {
-            boolean reserved = system.reserveSeat("A1", "alice", 5, new StandardPricing());
+            boolean reserved = system.reserveSeat("A1", "alice", new StandardPricing());
             System.out.println("✓ Seat A1 reserved: " + reserved);
             
             boolean confirmed = system.confirmBooking("A1", "alice");
@@ -362,7 +489,7 @@ public class SeatBooking {
         // Test Case 2: Premium Pricing
         System.out.println("\n=== Test Case 2: Premium Pricing ===");
         try {
-            boolean reserved = system.reserveSeat("B1", "bob", 5, new PremiumPricing());
+            boolean reserved = system.reserveSeat("B1", "bob", new PremiumPricing());
             System.out.println("✓ Seat B1 reserved with premium pricing: " + reserved);
         } catch (Exception e) {
             System.out.println("✗ Error: " + e.getMessage());
@@ -371,11 +498,11 @@ public class SeatBooking {
         // Test Case 3: Concurrent Booking Attempt
         System.out.println("\n=== Test Case 3: Concurrent Booking (same seat) ===");
         try {
-            system.reserveSeat("A2", "charlie", 5, new StandardPricing());
+            system.reserveSeat("A2", "charlie", new StandardPricing());
             System.out.println("✓ Charlie reserved A2");
             
             // Dave tries to book same seat - should fail
-            system.reserveSeat("A2", "dave", 5, new StandardPricing());
+            system.reserveSeat("A2", "dave", new StandardPricing());
             System.out.println("✗ Should have thrown SeatAlreadyBookedException");
         } catch (SeatAlreadyBookedException e) {
             System.out.println("✓ Caught expected exception: " + e.getMessage());
@@ -389,13 +516,13 @@ public class SeatBooking {
         // Test Case 4: Reservation Expiration
         System.out.println("\n=== Test Case 4: Reservation Expiration (2s timeout) ===");
         try {
-            system.reserveSeat("B2", "eve", 2, new WeekendPricing());
-            System.out.println("✓ B2 reserved with 2s timeout");
+            system.reserveSeat("B2", "eve", new WeekendPricing());
+            System.out.println("✓ B2 reserved (timeout = RESERVATION_TIMEOUT_SECONDS constant)");
             System.out.println("  Waiting 3 seconds for auto-expiration...");
             Thread.sleep(3000);
             
-            // Should be available again
-            system.reserveSeat("B2", "frank", 5, new StandardPricing());
+            // Should be available again (since constant is set to 2s for testing)
+            system.reserveSeat("B2", "frank", new StandardPricing());
             System.out.println("✓ B2 became available after expiration");
         } catch (Exception e) {
             System.out.println("✗ Error: " + e.getMessage());
@@ -407,7 +534,7 @@ public class SeatBooking {
         System.out.println("\n=== Test Case 5: Cancel Reservation ===");
         try {
             String seatId = system.addSeat("C1", 20.0);
-            system.reserveSeat("C1", "grace", 10, new StandardPricing());
+            system.reserveSeat("C1", "grace", new StandardPricing());
             System.out.println("✓ C1 reserved");
             
             boolean cancelled = system.cancelSeat("C1");
@@ -422,7 +549,7 @@ public class SeatBooking {
         // Test Case 6: Exception - Seat Not Found
         System.out.println("\n=== Test Case 6: Exception - Seat Not Found ===");
         try {
-            system.reserveSeat("INVALID", "user", 5, new StandardPricing());
+            system.reserveSeat("INVALID", "user", new StandardPricing());
             System.out.println("✗ Should have thrown SeatNotFoundException");
         } catch (SeatNotFoundException e) {
             System.out.println("✓ Caught expected exception: " + e.getMessage());

@@ -38,6 +38,101 @@ class InvalidSettlementException extends Exception {
     public InvalidSettlementException(String message) { super(message); }
 }
 
+// ===== STRATEGY PATTERN FOR SPLIT CALCULATION =====
+
+/**
+ * Strategy interface for splitting expenses
+ * Similar to LoadBalancingStrategy in LoadBalancerSystem
+ * Each split type is encapsulated in its own strategy class
+ */
+interface SplitStrategy {
+    /**
+     * Calculate how much each participant owes
+     * @param totalAmount Total expense amount
+     * @param participants List of participant user IDs
+     * @param splitDetails Optional details (exact amounts or percentages) - can be null for EQUAL
+     * @return Map of userId -> amount they owe
+     * @throws InvalidExpenseException if split details are invalid
+     */
+    Map<String, Double> calculateSplit(double totalAmount, List<String> participants, 
+                                        Map<String, Double> splitDetails) throws InvalidExpenseException;
+    SplitType getSplitType();
+}
+
+/**
+ * EQUAL SPLIT STRATEGY
+ * Divides total amount equally among all participants
+ * Similar to RoundRobinStrategy - simple, fair distribution
+ */
+class EqualSplitStrategy implements SplitStrategy {
+    @Override
+    public Map<String, Double> calculateSplit(double totalAmount, List<String> participants,
+                                               Map<String, Double> splitDetails) throws InvalidExpenseException {
+        if (participants == null || participants.isEmpty()) 
+            throw new InvalidExpenseException("Participants list cannot be empty");
+        
+        double perPerson = totalAmount / participants.size();
+        Map<String, Double> splits = new HashMap<>();
+        for (String userId : participants) {
+            splits.put(userId, perPerson);
+        }
+        return splits;
+    }
+    
+    @Override
+    public SplitType getSplitType() { return SplitType.EQUAL; }
+}
+
+/**
+ * EXACT SPLIT STRATEGY
+ * Each participant pays an exact specified amount
+ * Similar to LeastConnectionsStrategy - considers actual values
+ */
+class ExactSplitStrategy implements SplitStrategy {
+    @Override
+    public Map<String, Double> calculateSplit(double totalAmount, List<String> participants,
+                                               Map<String, Double> splitDetails) throws InvalidExpenseException {
+        if (splitDetails == null || splitDetails.isEmpty()) 
+            throw new InvalidExpenseException("Exact amounts cannot be empty");
+        
+        double sum = splitDetails.values().stream().mapToDouble(Double::doubleValue).sum();
+        if (Math.abs(totalAmount - sum) > 0.01) 
+            throw new InvalidExpenseException("Sum of exact amounts must equal total amount");
+        
+        return new HashMap<>(splitDetails);
+    }
+    
+    @Override
+    public SplitType getSplitType() { return SplitType.EXACT; }
+}
+
+/**
+ * PERCENTAGE SPLIT STRATEGY
+ * Each participant pays a percentage of the total
+ * Similar to RandomStrategy - distributes based on configured weights
+ */
+class PercentageSplitStrategy implements SplitStrategy {
+    @Override
+    public Map<String, Double> calculateSplit(double totalAmount, List<String> participants,
+                                               Map<String, Double> splitDetails) throws InvalidExpenseException {
+        if (splitDetails == null || splitDetails.isEmpty()) 
+            throw new InvalidExpenseException("Percentages cannot be empty");
+        
+        double percentageSum = splitDetails.values().stream().mapToDouble(Double::doubleValue).sum();
+        if (Math.abs(percentageSum - 100.0) > 0.01) 
+            throw new InvalidExpenseException("Percentages must sum to 100");
+        
+        Map<String, Double> splits = new HashMap<>();
+        for (Map.Entry<String, Double> entry : splitDetails.entrySet()) {
+            splits.put(entry.getKey(), totalAmount * entry.getValue() / 100.0);
+        }
+        return splits;
+    }
+    
+    @Override
+    public SplitType getSplitType() { return SplitType.PERCENTAGE; }
+}
+
 // ===== SUPPORTING CLASSES =====
 
 class User {
@@ -124,93 +219,77 @@ public class SplitwiseSystem {
     }
     
     /**
-     * Create expense with EQUAL split
+     * UNIFIED addExpense using STRATEGY PATTERN
+     * This is the core method - all split types delegate to the chosen SplitStrategy.
+     * Similar to how LoadBalancer.routeRequest() delegates to LoadBalancingStrategy.
+     *
+     * @param description  Expense description
+     * @param totalAmount  Total expense amount
+     * @param paidBy       User ID of the payer
+     * @param participants List of participant user IDs (used by EqualSplitStrategy)
+     * @param splitDetails Map of userId -> detail value (exact amounts or percentages), can be null for EQUAL
+     * @param strategy     The SplitStrategy to use for calculating splits
+     * @return Expense ID
      */
-    public String addEqualExpense(String description, double totalAmount, 
-                                  String paidBy, List<String> participants) 
+    public String addExpense(String description, double totalAmount, String paidBy,
+                             List<String> participants, Map<String, Double> splitDetails,
+                             SplitStrategy strategy) 
             throws UserNotFoundException, InvalidExpenseException {
+        // Validate common fields
         if (totalAmount <= 0) throw new InvalidExpenseException("Amount should be greater than 0");
-        if (participants == null || participants.isEmpty()) throw new InvalidExpenseException("Participants list cannot be empty");
         if (!users.containsKey(paidBy)) throw new UserNotFoundException(paidBy);
-        for (String userId : participants) {
+        
+        // Validate all participant user IDs exist
+        Set<String> allUserIds = new HashSet<>();
+        if (participants != null) allUserIds.addAll(participants);
+        if (splitDetails != null) allUserIds.addAll(splitDetails.keySet());
+        for (String userId : allUserIds) {
             if (!users.containsKey(userId)) throw new UserNotFoundException(userId);
         }
         
-        double perPerson = totalAmount / participants.size();
-        Map<String, Double> splits = new HashMap<>();
-        for (String userId : participants) {
-            splits.put(userId, perPerson);
-        }
-        
+        // DELEGATE split calculation to the strategy (Strategy Pattern!)
+        Map<String, Double> splits = strategy.calculateSplit(totalAmount, participants, splitDetails);
+        L
+        // Create and store the expense
         String expenseId = "EXP_" + (++expenseCounter);
-        Expense expense = new Expense(expenseId, description, totalAmount, paidBy, splits, SplitType.EQUAL);
+        Expense expense = new Expense(expenseId, description, totalAmount, paidBy, splits, strategy.getSplitType());
         expenses.put(expenseId, expense);
         
         // Update balances: each participant (except payer) owes the payer
-        for (String userId : participants) {
-            if (userId.equals(paidBy)) continue;  // Skip payer themselves
-            updateBalance(paidBy, userId, perPerson);
-        }
-        return expenseId;
-    }
-    
-    /**
-     * Create expense with EXACT amounts for each participant
-     */
-    public String addExactExpense(String description, double totalAmount, 
-                                  String paidBy, Map<String, Double> exactAmounts) 
-            throws UserNotFoundException, InvalidExpenseException {
-        if (totalAmount <= 0) throw new InvalidExpenseException("Amount should be greater than 0");
-        if (exactAmounts == null || exactAmounts.isEmpty()) throw new InvalidExpenseException("Exact amounts cannot be empty");
-        if (!users.containsKey(paidBy)) throw new UserNotFoundException(paidBy);
-        for (String userId : exactAmounts.keySet()) {
-            if (!users.containsKey(userId)) throw new UserNotFoundException(userId);
-        }
-        
-        double sum = exactAmounts.values().stream().mapToDouble(Double::doubleValue).sum();
-        if (Math.abs(totalAmount - sum) > 0.01) throw new InvalidExpenseException("Sum of exact amounts must equal total amount");
-        
-        String expenseId = "EXP_" + (++expenseCounter);
-        Expense expense = new Expense(expenseId, description, totalAmount, paidBy, new HashMap<>(exactAmounts), SplitType.EXACT);
-        expenses.put(expenseId, expense);
-        
-        for (Map.Entry<String, Double> entry : exactAmounts.entrySet()) {
-            if (entry.getKey().equals(paidBy)) continue;
-            updateBalance(paidBy, entry.getKey(), entry.getValue());
-        }
-        return expenseId;
-    }
-    
-    /**
-     * Create expense with PERCENTAGE split
-     */
-    public String addPercentageExpense(String description, double totalAmount, 
-                                       String paidBy, Map<String, Double> percentages) 
-            throws UserNotFoundException, InvalidExpenseException {
-        if (totalAmount <= 0) throw new InvalidExpenseException("Amount should be greater than 0");
-        if (percentages == null || percentages.isEmpty()) throw new InvalidExpenseException("Percentages cannot be empty");
-        if (!users.containsKey(paidBy)) throw new UserNotFoundException(paidBy);
-        for (String userId : percentages.keySet()) {
-            if (!users.containsKey(userId)) throw new UserNotFoundException(userId);
-        }
-        
-        double percentageSum = percentages.values().stream().mapToDouble(Double::doubleValue).sum();
-        if (Math.abs(percentageSum - 100.0) > 0.01) throw new InvalidExpenseException("Percentages must sum to 100");
-        
-        Map<String, Double> splits = new HashMap<>();
-        for (Map.Entry<String, Double> entry : percentages.entrySet()) {
-            splits.put(entry.getKey(), totalAmount * entry.getValue() / 100.0);
-        }
-        
-        String expenseId = "EXP_" + (++expenseCounter);
-        Expense expense = new Expense(expenseId, description, totalAmount, paidBy, splits, SplitType.PERCENTAGE);
-        expenses.put(expenseId, expense);
-        
         for (Map.Entry<String, Double> entry : splits.entrySet()) {
             if (entry.getKey().equals(paidBy)) continue;
             updateBalance(paidBy, entry.getKey(), entry.getValue());
         }
         return expenseId;
+    }
+    
+    /**
+     * Convenience: Create expense with EQUAL split (delegates to Strategy)
+     */
+    public String addEqualExpense(String description, double totalAmount, 
+                                  String paidBy, List<String> participants) 
+            throws UserNotFoundException, InvalidExpenseException {
+        return addExpense(description, totalAmount, paidBy, participants, null, new EqualSplitStrategy());
+    }
+    
+    /**
+     * Convenience: Create expense with EXACT amounts (delegates to Strategy)
+     */
+    public String addExactExpense(String description, double totalAmount, 
+                                  String paidBy, Map<String, Double> exactAmounts) 
+            throws UserNotFoundException, InvalidExpenseException {
+        List<String> participants = new ArrayList<>(exactAmounts.keySet());
+        return addExpense(description, totalAmount, paidBy, participants, exactAmounts, new ExactSplitStrategy());
+    }
+    
+    /**
+     * Convenience: Create expense with PERCENTAGE split (delegates to Strategy)
+     */
+    public String addPercentageExpense(String description, double totalAmount, 
+                                       String paidBy, Map<String, Double> percentages) 
+            throws UserNotFoundException, InvalidExpenseException {
+        List<String> participants = new ArrayList<>(percentages.keySet());
+        return addExpense(description, totalAmount, paidBy, participants, percentages, new PercentageSplitStrategy());
     }
     
     /**
@@ -250,7 +329,7 @@ public class SplitwiseSystem {
         if (amount - debt > 0.01) throw new InvalidSettlementException("Settlement amount exceeds owed debt");
         
         // Reduce debt: receiver is lender, payer is borrower, negative amount to reduce
-        updateBalance(receiver, payer, -amount);
+        updateBalance(receiver, payer, -amount;
     }
     
     /**
@@ -583,6 +662,45 @@ public class SplitwiseSystem {
             for (Expense e : userExpenses) {
                 System.out.println("  " + e.getDescription() + " ($" + String.format("%.2f", e.getTotalAmount()) + ", " + e.getSplitType() + ")");
             }
+        } catch (Exception e) {
+            System.out.println("✗ Error: " + e.getMessage());
+        }
+        System.out.println();
+        
+        // Test Case 16: Strategy Pattern - Direct addExpense with pluggable strategy
+        System.out.println("=== Test Case 16: STRATEGY PATTERN - Direct addExpense ===");
+        try {
+            // Use EqualSplitStrategy directly via addExpense
+            SplitStrategy equalStrategy = new EqualSplitStrategy();
+            String expId1 = splitwise.addExpense(
+                "Cab ride (Equal Strategy)", 120.0, "U1",
+                Arrays.asList("U1", "U2", "U3"), null, equalStrategy
+            );
+            System.out.println("✓ Equal strategy expense: " + expId1);
+            
+            // Use ExactSplitStrategy directly via addExpense
+            SplitStrategy exactStrategy = new ExactSplitStrategy();
+            Map<String, Double> exactDetails = new HashMap<>();
+            exactDetails.put("U1", 30.0);
+            exactDetails.put("U2", 70.0);
+            String expId2 = splitwise.addExpense(
+                "Snacks (Exact Strategy)", 100.0, "U1",
+                new ArrayList<>(exactDetails.keySet()), exactDetails, exactStrategy
+            );
+            System.out.println("✓ Exact strategy expense: " + expId2);
+            
+            // Use PercentageSplitStrategy directly via addExpense
+            SplitStrategy pctStrategy = new PercentageSplitStrategy();
+            Map<String, Double> pctDetails = new HashMap<>();
+            pctDetails.put("U1", 40.0);
+            pctDetails.put("U2", 60.0);
+            String expId3 = splitwise.addExpense(
+                "Gifts (Percentage Strategy)", 200.0, "U2",
+                new ArrayList<>(pctDetails.keySet()), pctDetails, pctStrategy
+            );
+            System.out.println("✓ Percentage strategy expense: " + expId3);
+            
+            System.out.println("✓ All strategies work via unified addExpense() method!");
         } catch (Exception e) {
             System.out.println("✗ Error: " + e.getMessage());
         }

@@ -159,12 +159,12 @@ class LRUEvictionPolicy<K, V> implements EvictionPolicy<K, V> {
      * @return The evicted node (LRU)
      */
     @Override
-    public DLLNode<K, V> evict() {
+    public DLLNode<K, V> evict() {  
         // HINT: if (tail.prev == head) return null; // Empty list
         // HINT: DLLNode<K, V> lru = tail.prev;
         // HINT: removeNode(lru);
         // HINT: return lru;
-        if(tail.prev == null) return null;
+        if(tail.prev == head) return null;
         DLLNode<K,V> lru=tail.prev;
         removeNode(lru);
         return lru;

@@ -1,6 +1,5 @@
 import java.time.LocalDateTime;
 import java.util.*;
-import java.util.stream.Collector;
 import java.util.stream.Collectors;
 
 // ===== CUSTOM EXCEPTION CLASSES =====
@@ -299,7 +298,7 @@ class Locker {
         // HINT: Sort by .comparing(c -> c.size.ordinal())
         // HINT: Return smallest available larger size
         return  compartments.stream().filter(c->c.status==CompartmentStatus.FREE && c.size.ordinal() > size.ordinal())
-        .sorted(Comparator.comparingInt(c -> c.size.ordinal())).findFirst().orElse(null);
+        .sorted(Comparator.comparingInt(c -> c.size.ordinal())).findFirst().orElse(null);:
     }
     
     /**

@@ -271,6 +271,8 @@ class BookingService {
         // TODO: Implement
         // HINT: theaters.add(theater);
         // HINT: System.out.println("Added theater: " + theater.name);
+        theaters.add(theater);
+        System.out.println("Added theater: " + theater.name);
     }
     
     /**

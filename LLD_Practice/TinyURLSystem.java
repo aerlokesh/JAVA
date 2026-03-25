@@ -366,7 +366,7 @@ public class TinyURLSystem {
      * Example: "http://tiny.url/abc123" -> "abc123"
      * 
      * @param shortURL The full short URL
-     * @return The short code extracted from URL
+     * @return The[] short code extracted from URL
      */
     private String extractShortCode(String shortURL) {
         if(shortURL == null ||!shortURL.startsWith(BASE_URL)){
@@ -386,14 +386,15 @@ public class TinyURLSystem {
      * @return true if deleted, false if not found
      */
     public boolean delete(String shortURL) {
-        if(!shortToLongMap.containsKey(shortURL)) return false;
-        shortToLongMap.remove(shortURL);
-        String longUrl = shortToLongMap.get(shortURL);
-        if(longUrl!=null){
-            longToShortMap.remove(shortURL);
+        String shortCode = extractShortCode(shortURL);
+        if(!shortToLongMap.containsKey(shortCode)) return false;
+        String longUrl = shortToLongMap.get(shortCode);
+        shortToLongMap.remove(shortCode);
+        if(longUrl != null){
+            longToShortMap.remove(longUrl);
         }
-        expirationMap.remove(shortURL);
-        return false;
+        expirationMap.remove(shortCode);
+        return true;
     }
     
     // ===== TEST DRIVER =====

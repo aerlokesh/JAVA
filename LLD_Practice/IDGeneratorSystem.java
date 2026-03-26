@@ -1,4 +1,3 @@
-import java.time.*;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -16,16 +15,11 @@ class InvalidConfigException extends Exception {
     }
 }
 
-// ===== ENUMS =====
-
-enum IDType { SNOWFLAKE, UUID, AUTO_INCREMENT }
-
 // ===== INTERFACE (Strategy Pattern) =====
 
 interface IDGenerator {
     long nextId() throws IDGenerationException;
     String nextIdString() throws IDGenerationException;
-    IDType getType();
 }
 
 // ===== 1. SNOWFLAKE GENERATOR (Main Interview Question) =====
@@ -74,7 +68,6 @@ class SnowflakeGenerator implements IDGenerator {
      * 3. Init lastTimestamp = -1, sequence = 0
      */
     public SnowflakeGenerator(int datacenterId, int machineId) throws InvalidConfigException {
-        // TODO: Implement
         // HINT: if (datacenterId < 0 || datacenterId > MAX_DATACENTER_ID)
         //           throw new InvalidConfigException("DC ID must be 0-31");
         // HINT: if (machineId < 0 || machineId > MAX_MACHINE_ID)
@@ -149,35 +142,11 @@ class SnowflakeGenerator implements IDGenerator {
         return (timestamp<<TIMESTAMP_SHIFT)|(datacenterId<<DATACENTER_SHIFT)|(machineId<<MACHINE_SHIFT)|sequence;
     }
     
-    /**
-     * Parse a Snowflake ID back to its parts (useful for debugging)
-     * 
-     * IMPLEMENTATION HINTS:
-     * 1. timestamp  = (id >> 22) + EPOCH  → gives back millis
-     * 2. datacenter = (id >> 17) & 31
-     * 3. machine    = (id >> 12) & 31
-     * 4. sequence   = id & 4095
-     */
-    public String parseId(long id) {
-        // HINT: long ts = (id >> TIMESTAMP_SHIFT) + EPOCH;
-        // HINT: int dc   = (int)((id >> DATACENTER_SHIFT) & MAX_DATACENTER_ID);
-        // HINT: int mc   = (int)((id >> MACHINE_SHIFT) & MAX_MACHINE_ID);
-        // HINT: int seq  = (int)(id & MAX_SEQUENCE);
-        // HINT: return "time=" + Instant.ofEpochMilli(ts) + ", dc=" + dc + ", machine=" + mc + ", seq=" + seq;
-        long ts=(id>>TIMESTAMP_SHIFT)+EPOCH;
-        long dc=(id>>DATACENTER_SHIFT)&MAX_DATACENTER_ID;
-        long mc=(id>>MACHINE_SHIFT)&MAX_MACHINE_ID;  // BUG FIX: was (id & MAX_SEQUENCE) - that's sequence not machine!
-        long seq=(id&MAX_SEQUENCE);
-        return "time=" + Instant.ofEpochMilli(ts) + ", dc=" + dc + ", machine=" + mc + ", seq=" + seq;
-    }
-    
     @Override
     public String nextIdString() throws IDGenerationException {
         return String.valueOf(nextId());
     }
     
-    @Override
-    public IDType getType() { return IDType.SNOWFLAKE; }
 }
 
 // ===== 2. AUTO-INCREMENT GENERATOR (Simplest) =====
@@ -214,8 +183,6 @@ class AutoIncrementGenerator implements IDGenerator {
         return prefix+counter.incrementAndGet();
     }
     
-    @Override
-    public IDType getType() { return IDType.AUTO_INCREMENT; }
 }
 
 // ===== 3. UUID GENERATOR =====
@@ -238,8 +205,6 @@ class UUIDGenerator implements IDGenerator {
         return UUID.randomUUID().toString();
     }
     
-    @Override
-    public IDType getType() { return IDType.UUID; }
 }
 
 // ===== SERVICE =====
@@ -272,7 +237,7 @@ class IDGeneratorService {
         // HINT: generators.put(name, generator);
         // HINT: System.out.println("  ✓ Registered: " + name + " (" + generator.getType() + ")");
         generators.put(name, generator);
-        System.out.println("  ✓ Registered: " + name + " (" + generator.getType() + ")");
+        System.out.println("  ✓ Registered: " + name);
     }
     
     /**
@@ -353,20 +318,7 @@ public class IDGeneratorSystem {
         }
         System.out.println();
         
-        // Test 2: Parse Snowflake ID
-        System.out.println("=== Test 2: Parse Snowflake ID ===");
-        try {
-            long id = service.generateId("snowflake");
-            SnowflakeGenerator sf = (SnowflakeGenerator) service.getGenerator("snowflake");
-            String parsed = sf.parseId(id);
-            System.out.println("✓ ID: " + id);
-            System.out.println("  Parsed: " + (parsed != null ? parsed : "null (implement parseId!)"));
-        } catch (Exception e) {
-            System.out.println("✗ Error: " + e.getMessage());
-        }
-        System.out.println();
-        
-        // Test 3: UUID
+        // Test 2: UUID
         System.out.println("=== Test 3: UUID IDs ===");
         try {
             String uuid1 = service.generateIdString("uuid");

@@ -42,30 +42,6 @@ class InvalidVehicleException extends Exception {
     public InvalidVehicleException(String message) { super(message); }
 }
 
-/**
- * Exception thrown when trying to park in an occupied spot
- * WHEN TO THROW:
- * - Spot already has a vehicle (race condition edge case)
- */
-class SpotAlreadyOccupiedException extends Exception {
-    private String spotId;
-    public SpotAlreadyOccupiedException(String spotId) {
-        super("Spot already occupied: " + spotId);
-        this.spotId = spotId;
-    }
-    public String getSpotId() { return spotId; }
-}
-
-/**
- * Exception thrown for invalid ticket operations
- * WHEN TO THROW:
- * - Ticket ID not found
- * - Ticket already used for exit
- */
-class InvalidTicketException extends Exception {
-    public InvalidTicketException(String message) { super(message); }
-}
-
 // ===== ENUMS =====
 
 /**
@@ -138,13 +114,17 @@ class ParkingSpot {
      * HINT: MOTORCYCLE fits anywhere, CAR fits REGULAR+LARGE, TRUCK/BUS needs LARGE
      */
     public boolean canFit(VehicleType vehicleType) {
-        // TODO: Implement
         // HINT: switch on vehicleType:
         //   MOTORCYCLE → any spot (COMPACT, REGULAR, LARGE) → return true
         //   CAR → REGULAR or LARGE → return type == SpotType.REGULAR || type == SpotType.LARGE
         //   TRUCK, BUS → LARGE only → return type == SpotType.LARGE
         //   default → return false
-        return false;
+        return switch (vehicleType) {
+            case MOTORCYCLE -> true;
+            case CAR -> type==SpotType.REGULAR || type==SpotType.LARGE;
+            case TRUCK, BUS -> type==SpotType.LARGE;
+            default -> false;
+        };
     }
 
     public void park(Vehicle vehicle) { this.currentVehicle = vehicle; }
@@ -217,10 +197,7 @@ class ParkingLotService {
     private int numFloors;
     private List<List<ParkingSpot>> floors;          // floor index → list of spots
     private Map<String, ParkingTicket> activeTickets; // licensePlate → ticket
-    private Map<String, ParkingTicket> ticketById;    // ticketId → ticket
     private AtomicInteger ticketCounter;
-
-    // Fee rates per hour by vehicle type
     private Map<VehicleType, Double> hourlyRates;
 
     public ParkingLotService(String name, int numFloors, int compactPerFloor, int regularPerFloor, int largePerFloor) {
@@ -228,7 +205,6 @@ class ParkingLotService {
         this.numFloors = numFloors;
         this.floors = new ArrayList<>();
         this.activeTickets = new HashMap<>();
-        this.ticketById = new HashMap<>();
         this.ticketCounter = new AtomicInteger(1);
 
         this.hourlyRates = new EnumMap<>(VehicleType.class);
@@ -250,7 +226,6 @@ class ParkingLotService {
      * 4. Add all spots for a floor to a list, then add that list to floors
      */
     private void initializeFloors(int compact, int regular, int large) {
-        // TODO: Implement
         // HINT: for (int f = 1; f <= numFloors; f++) {
         //     List<ParkingSpot> floorSpots = new ArrayList<>();
         //     for (int i = 1; i <= compact; i++)
@@ -261,6 +236,13 @@ class ParkingLotService {
         //         floorSpots.add(new ParkingSpot(String.format("F%d-L%02d", f, i), SpotType.LARGE, f));
         //     floors.add(floorSpots);
         // }
+        for(int f=1;f<=numFloors;f++){
+            List<ParkingSpot> l=new ArrayList<>();
+            for(int i=0;i<compact;i++) l.add(new ParkingSpot(String.format("F%d-C%d",f,i), SpotType.COMPACT, f));
+            for(int i=0;i<regular;i++) l.add(new ParkingSpot(String.format("F%d-C%d",f,i), SpotType.COMPACT, f));
+            for(int i=0;i<large;i++) l.add(new ParkingSpot(String.format("F%d-C%d",f,i), SpotType.COMPACT, f));
+            floors.add(l);
+        }
     }
 
     // ===== CORE OPERATIONS =====
@@ -278,7 +260,6 @@ class ParkingLotService {
      * INTERVIEW: Discuss synchronized/lock for concurrent gate entry
      */
     public ParkingTicket park(Vehicle vehicle) throws InvalidVehicleException, ParkingFullException {
-        // TODO: Implement
         // HINT: if (vehicle == null || vehicle.licensePlate == null || vehicle.licensePlate.isEmpty())
         //     throw new InvalidVehicleException("Vehicle or license plate is invalid");
         // HINT: if (activeTickets.containsKey(vehicle.licensePlate))
@@ -291,7 +272,15 @@ class ParkingLotService {
         // HINT: activeTickets.put(vehicle.licensePlate, ticket);
         // HINT: ticketById.put(ticketId, ticket);
         // HINT: return ticket;
-        return null;
+        if(vehicle==null || vehicle.licensePlate==null || vehicle.licensePlate.isEmpty()) throw new InvalidVehicleException("Vehicle or license plate invalid");
+        if(activeTickets.containsKey(vehicle.licensePlate)) throw new InvalidVehicleException("Vehicle already parked");
+        ParkingSpot spot=findAvailableSpot(vehicle.type);
+        if(spot==null) throw new ParkingFullException(vehicle.type.name());
+        spot.park(vehicle);
+        String ticketId="T-"+ticketCounter.incrementAndGet();
+        ParkingTicket ticket=new ParkingTicket(ticketId, vehicle, spot);
+        activeTickets.put(vehicle.licensePlate, ticket);
+        return ticket;
     }
 
     /**
@@ -306,7 +295,6 @@ class ParkingLotService {
      * INTERVIEW: Fee = ceil(hours) * hourlyRate[vehicleType]
      */
     public ParkingTicket unpark(String licensePlate) throws VehicleNotFoundException {
-        // TODO: Implement
         // HINT: ParkingTicket ticket = activeTickets.get(licensePlate);
         // HINT: if (ticket == null) throw new VehicleNotFoundException(licensePlate);
         // HINT: ticket.exitTime = System.currentTimeMillis();
@@ -314,7 +302,13 @@ class ParkingLotService {
         // HINT: ticket.spot.unpark();
         // HINT: activeTickets.remove(licensePlate);
         // HINT: return ticket;
-        return null;
+        ParkingTicket ticket=activeTickets.get(licensePlate);
+        if(ticket==null) throw new VehicleNotFoundException(licensePlate);
+        ticket.exitTime=System.currentTimeMillis();
+        ticket.fee=calculateFee(ticket);
+        ticket.spot.unpark();
+        activeTickets.remove(licensePlate);
+        return ticket;
     }
 
     /**
@@ -330,14 +324,14 @@ class ParkingLotService {
      * This implementation IS best-fit because spots are ordered COMPACT→REGULAR→LARGE
      */
     private ParkingSpot findAvailableSpot(VehicleType vehicleType) {
-        // TODO: Implement
         // HINT: for (List<ParkingSpot> floor : floors) {
         //     for (ParkingSpot spot : floor) {
         //         if (spot.isAvailable() && spot.canFit(vehicleType)) return spot;
         //     }
         // }
         // HINT: return null;
-        return null;
+        
+        return floors.stream().flatMap(List::stream).filter(ParkingSpot::isAvailable).filter(spot->spot.canFit(vehicleType)).findFirst().orElse(null);
     }
 
     /**
@@ -352,64 +346,21 @@ class ParkingLotService {
      * (flat-rate, hourly, dynamic/peak pricing, first-hour-free, etc.)
      */
     private double calculateFee(ParkingTicket ticket) {
-        // TODO: Implement
         // HINT: long durationMs = ticket.exitTime - ticket.entryTime;
         // HINT: int hours = (int) Math.ceil(durationMs / 3600000.0);
         // HINT: hours = Math.max(1, hours); // minimum 1 hour charge
         // HINT: return hours * hourlyRates.get(ticket.vehicle.type);
-        return 0;
-    }
-
-    /**
-     * Get count of available spots by type across all floors
-     */
-    public Map<SpotType, Integer> getAvailableSpots() {
-        // TODO: Implement
-        // HINT: Map<SpotType, Integer> available = new EnumMap<>(SpotType.class);
-        // HINT: for (SpotType t : SpotType.values()) available.put(t, 0);
-        // HINT: for each floor, for each spot:
-        //     if (spot.isAvailable()) available.merge(spot.type, 1, Integer::sum);
-        // HINT: return available;
-        return new EnumMap<>(SpotType.class);
-    }
-
-    /**
-     * Get available spots on a specific floor
-     */
-    public Map<SpotType, Integer> getAvailableSpotsOnFloor(int floorNum) {
-        // TODO: Implement
-        // HINT: Map<SpotType, Integer> available = new EnumMap<>(SpotType.class);
-        // HINT: for (SpotType t : SpotType.values()) available.put(t, 0);
-        // HINT: if (floorNum < 1 || floorNum > numFloors) return available;
-        // HINT: for (ParkingSpot spot : floors.get(floorNum - 1))
-        //     if (spot.isAvailable()) available.merge(spot.type, 1, Integer::sum);
-        // HINT: return available;
-        return new EnumMap<>(SpotType.class);
+        return Math.max((int)(Math.ceil(ticket.exitTime-ticket.entryTime)/60*60*1000),1) * hourlyRates.get(ticket.vehicle.type);
     }
 
     /**
      * Check if lot is full for a given vehicle type
      */
     public boolean isFull(VehicleType vehicleType) {
-        // TODO: Implement
         // HINT: return findAvailableSpot(vehicleType) == null;
-        return false;
+        return findAvailableSpot(vehicleType) == null;
     }
 
-    /**
-     * Display parking lot status
-     */
-    public void displayStatus() {
-        System.out.println("\n--- " + name + " Status ---");
-        System.out.println("Active vehicles: " + activeTickets.size());
-        Map<SpotType, Integer> avail = getAvailableSpots();
-        avail.forEach((type, count) -> System.out.println("  " + type + " available: " + count));
-        for (int f = 0; f < floors.size(); f++) {
-            long occupied = floors.get(f).stream().filter(s -> !s.isAvailable()).count();
-            long total = floors.get(f).size();
-            System.out.println("  Floor " + (f + 1) + ": " + occupied + "/" + total + " occupied");
-        }
-    }
 }
 
 // ===== MAIN TEST CLASS =====
@@ -420,9 +371,7 @@ public class ParkingLotSystem {
 
         // Setup: 2 floors, 3 compact, 3 regular, 2 large per floor
         ParkingLotService lot = new ParkingLotService("City Mall Parking", 2, 3, 3, 2);
-        System.out.println("Parking lot created: 2 floors, 3C+3R+2L per floor");
-        System.out.println("Available: " + lot.getAvailableSpots());
-        System.out.println();
+        System.out.println("Parking lot created: 2 floors, 3C+3R+2L per floor\n");
 
         // Test 1: Park a car
         System.out.println("=== Test 1: Park a Car ===");
@@ -536,16 +485,8 @@ public class ParkingLotSystem {
         }
         System.out.println();
 
-        // Test 10: Floor availability
-        System.out.println("=== Test 10: Floor Availability ===");
-        System.out.println("  Floor 1: " + lot.getAvailableSpotsOnFloor(1));
-        System.out.println("  Floor 2: " + lot.getAvailableSpotsOnFloor(2));
-        System.out.println("  Is full for TRUCK? " + lot.isFull(VehicleType.TRUCK));
-        System.out.println("  Is full for MOTORCYCLE? " + lot.isFull(VehicleType.MOTORCYCLE));
-        System.out.println();
-
-        // Test 11: Unpark and re-park (spot reuse)
-        System.out.println("=== Test 11: Spot Reuse After Unpark ===");
+        // Test 10: Unpark and re-park (spot reuse)
+        System.out.println("=== Test 10: Spot Reuse After Unpark ===");
         try {
             ParkingTicket exitTicket = lot.unpark("MH-01-1111");
             System.out.println("  Freed spot: " + exitTicket.spot.spotId);
@@ -557,9 +498,7 @@ public class ParkingLotSystem {
         }
         System.out.println();
 
-        // Final status
-        lot.displayStatus();
-        System.out.println("\n=== All Tests Complete! ===");
+        System.out.println("=== All Tests Complete! ===");
     }
 }
 

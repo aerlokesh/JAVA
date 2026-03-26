@@ -1,6 +1,5 @@
 import java.util.*;
 import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicInteger;
 
 // ===== CUSTOM EXCEPTION CLASSES =====
 
@@ -57,7 +56,6 @@ enum RequestResult {
 interface RateLimiter {
     boolean allowRequest(String clientId);
     String getName();
-    String getStats(String clientId);
 }
 
 /**
@@ -151,22 +149,19 @@ class TokenBucketRateLimiter implements RateLimiter {
         // HINT: bucket[1] = now;
         // HINT: if (bucket[0] >= 1) { bucket[0] -= 1; return true; }
         // HINT: return false;
+        // BUG FIXES: 1) parentheses on elapsed calc  2) -= 1 not = -1
         long now=System.nanoTime();
         double[] bucket = buckets.computeIfAbsent(clientId, k->new double[]{capacity,now});
+        double elapsed = (now - bucket[1]) / 1_000_000_000.0;
+        bucket[0]=Math.min(capacity, bucket[0]+elapsed*refillRate);
+        bucket[1]=now;
+        if(bucket[0]>=1) {bucket[0] -= 1; return true;}
         return false;
     }
     
     @Override
     public String getName() { 
         return "TokenBucket(cap=" + capacity + ",rate=" + refillRate + "/s)"; 
-    }
-    
-    @Override
-    public String getStats(String clientId) {
-        // TODO: Implement
-        // HINT: Get bucket and return formatted string with current tokens
-        // HINT: String.format("%.2f tokens available", bucket[0])
-        return "not implemented";
     }
 }
 
@@ -224,12 +219,15 @@ class FixedWindowRateLimiter implements RateLimiter {
      */
     @Override
     public synchronized boolean allowRequest(String clientId) {
-        // TODO: Implement
         // HINT: long now = System.currentTimeMillis();
         // HINT: long[] window = windows.computeIfAbsent(clientId, k -> new long[]{now, 0});
         // HINT: if (now - window[0] >= windowMillis) { window[0] = now; window[1] = 0; }
         // HINT: if (window[1] < maxRequests) { window[1]++; return true; }
         // HINT: return false;
+        long now=System.currentTimeMillis();
+        long[] window=windows.computeIfAbsent(clientId, k->new long[]{now,0});
+        if(now-window[0]>=windowMillis){window[0]=now; window[1]=0;}
+        if(window[1]<maxRequests) {window[1]++; return true;}
         return false;
     }
     
@@ -238,12 +236,6 @@ class FixedWindowRateLimiter implements RateLimiter {
         return "FixedWindow(max=" + maxRequests + ",window=" + windowMillis + "ms)"; 
     }
     
-    @Override
-    public String getStats(String clientId) {
-        // TODO: Implement
-        // HINT: Return request count in current window
-        return "not implemented";
-    }
 }
 
 // ===== SLIDING WINDOW LOG ALGORITHM =====
@@ -302,7 +294,6 @@ class SlidingWindowLogRateLimiter implements RateLimiter {
      */
     @Override
     public synchronized boolean allowRequest(String clientId) {
-        // TODO: Implement
         // HINT: long now = System.currentTimeMillis();
         // HINT: Deque<Long> log = logs.computeIfAbsent(clientId, k -> new ArrayDeque<>());
         // HINT: while (!log.isEmpty() && (now - log.peekFirst()) >= windowMillis) {
@@ -310,6 +301,10 @@ class SlidingWindowLogRateLimiter implements RateLimiter {
         //       }
         // HINT: if (log.size() < maxRequests) { log.addLast(now); return true; }
         // HINT: return false;
+        long now=System.currentTimeMillis();
+        Deque<Long> log=logs.computeIfAbsent(clientId, k->new ArrayDeque<>());
+        while(!log.isEmpty() && (now-log.peekFirst()>=windowMillis)) log.pollFirst();
+        if(log.size()<maxRequests){log.addLast(now); return true;}
         return false;
     }
     
@@ -318,12 +313,6 @@ class SlidingWindowLogRateLimiter implements RateLimiter {
         return "SlidingWindowLog(max=" + maxRequests + ",window=" + windowMillis + "ms)"; 
     }
     
-    @Override
-    public String getStats(String clientId) {
-        // TODO: Implement
-        // HINT: Return number of requests in current window
-        return "not implemented";
-    }
 }
 
 // ===== RATE LIMITER SERVICE =====
@@ -334,8 +323,6 @@ class SlidingWindowLogRateLimiter implements RateLimiter {
 class RateLimiterService {
     private final Map<String, RateLimiter> endpointLimiters;
     private final RateLimiter defaultLimiter;
-    private final AtomicInteger totalAllowed = new AtomicInteger(0);
-    private final AtomicInteger totalDenied = new AtomicInteger(0);
     
     public RateLimiterService(RateLimiter defaultLimiter) {
         this.endpointLimiters = new ConcurrentHashMap<>();
@@ -353,10 +340,12 @@ class RateLimiterService {
      * @param limiter Rate limiter for this endpoint
      */
     public void registerEndpoint(String endpoint, RateLimiter limiter) {
-        // TODO: Implement
         // HINT: if (endpoint == null || limiter == null) return;
         // HINT: endpointLimiters.put(endpoint, limiter);
         // HINT: System.out.println("Registered: " + endpoint + " → " + limiter.getName());
+        if(endpoint==null || limiter == null) return;
+        endpointLimiters.put(endpoint, limiter);
+        System.out.println("Registered: " + endpoint + " → " + limiter.getName());
     }
     
     /**
@@ -373,12 +362,13 @@ class RateLimiterService {
      * @return ALLOWED if within limit, DENIED otherwise
      */
     public RequestResult processRequest(String endpoint, String clientId) {
-        // TODO: Implement
         // HINT: RateLimiter limiter = endpointLimiters.getOrDefault(endpoint, defaultLimiter);
         // HINT: boolean allowed = limiter.allowRequest(clientId);
         // HINT: if (allowed) totalAllowed.incrementAndGet(); else totalDenied.incrementAndGet();
         // HINT: return allowed ? RequestResult.ALLOWED : RequestResult.DENIED;
-        return null;
+        RateLimiter limiter = endpointLimiters.getOrDefault(endpoint, defaultLimiter);
+        boolean allowed = limiter.allowRequest(clientId);
+        return allowed ? RequestResult.ALLOWED : RequestResult.DENIED;
     }
     
     /**
@@ -396,27 +386,18 @@ class RateLimiterService {
      * @return Array [allowed, denied]
      */
     public int[] batchRequests(String endpoint, String clientId, int count) {
-        // TODO: Implement
         // HINT: int allowed = 0, denied = 0;
         // HINT: for (int i = 0; i < count; i++) {
         //     if (processRequest(endpoint, clientId) == RequestResult.ALLOWED) allowed++; else denied++;
         // }
         // HINT: return new int[]{allowed, denied};
-        return new int[]{0, 0};
+        int allowed=0,denied=0;
+        for(int i=0;i<count;i++){
+            if(processRequest(endpoint, clientId)==RequestResult.ALLOWED) allowed++; else denied++;
+        }
+        return new int[]{allowed, denied};
     }
     
-    /**
-     * Display service status
-     */
-    public void displayStatus() {
-        System.out.println("\n--- Rate Limiter Service Status ---");
-        System.out.println("Default Limiter: " + defaultLimiter.getName());
-        System.out.println("Endpoint-specific limiters:");
-        endpointLimiters.forEach((ep, rl) -> 
-            System.out.println("  " + ep + " → " + rl.getName()));
-        System.out.println("Total: " + totalAllowed.get() + " allowed, " + 
-                         totalDenied.get() + " denied");
-    }
 }
 
 // ===== MAIN TEST CLASS =====
@@ -432,8 +413,6 @@ public class RateLimiterSystem {
         service.registerEndpoint("/api/login", new FixedWindowRateLimiter(3, 1000));
         service.registerEndpoint("/api/search", new SlidingWindowLogRateLimiter(5, 2000));
         service.registerEndpoint("/api/payment", new TokenBucketRateLimiter(2, 0.5));
-        
-        service.displayStatus();
         
         // Test Case 1: Token Bucket - Burst Capability
         System.out.println("\n=== Test Case 1: TOKEN BUCKET (burst of 8) ===");
@@ -499,8 +478,7 @@ public class RateLimiterSystem {
         System.out.println("✓ Different limits for different endpoints");
         System.out.println();
         
-        service.displayStatus();
-        System.out.println("\n=== All Test Cases Complete! ===");
+        System.out.println("=== All Test Cases Complete! ===");
     }
 }
 

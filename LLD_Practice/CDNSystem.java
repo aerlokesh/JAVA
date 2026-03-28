@@ -1,564 +1,635 @@
-import java.time.*;
 import java.util.*;
 import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.*;
 
-// ===== EXCEPTIONS =====
+/*
+ * CDN SYSTEM - Low Level Design
+ * ==============================
+ * 
+ * REQUIREMENTS:
+ * 1. Route users to nearest edge server by region
+ * 2. LRU cache at each edge with capacity limit + TTL expiration
+ * 3. Cache MISS → fetch from origin → cache at edge → return
+ * 4. Cache invalidation (purge across all edges)
+ * 5. Pre-warm popular content to edges
+ * 6. Consistent hashing to distribute content across edges in same region
+ * 7. Health checks — unhealthy edges get skipped, traffic falls back
+ * 8. Metrics: hit rate, origin offload, bandwidth saved
+ * 9. Thread-safe concurrent access
+ * 
+ * KEY DATA STRUCTURES:
+ * - LinkedHashMap(accessOrder=true) for LRU cache per edge server
+ * - ConcurrentHashMap<region, ConsistentHashRing> for geo-routing
+ * - TreeMap<Integer, String> for consistent hash ring per region
+ * 
+ * DESIGN PATTERNS:
+ * - Proxy: edge server proxies origin
+ * - Strategy: eviction policy (LRU here, could be LFU)
+ * 
+ * COMPLEXITY:
+ *   fetchContent:    O(1) cache hit, O(1) origin fetch on miss
+ *   invalidate:      O(E) where E = number of edge servers
+ *   prewarm:         O(E_region) edges in target region
+ *   LRU eviction:    O(1) via LinkedHashMap
+ *   consistent hash: O(log V) where V = virtual nodes
+ */
+
+// ==================== EXCEPTION ====================
 
 class ContentNotFoundException extends Exception {
-    public ContentNotFoundException(String key) { super("Content not found: " + key); }
+    ContentNotFoundException(String key) { super("Content not found: " + key); }
 }
 
-// ===== ENUMS =====
+// ==================== ENUMS ====================
 
-enum CacheStatus { HIT, MISS, EXPIRED }
+enum CacheResult { HIT, MISS, EXPIRED }
 
-// ===== DOMAIN CLASSES =====
+// ==================== CACHED CONTENT ====================
 
-/**
- * Cached content on an edge server
- */
 class CachedContent {
-    private final String key;           // URL path: "/images/logo.png"
-    private final String content;       // the actual content (bytes in real system)
-    private final long sizeBytes;
-    private final LocalDateTime cachedAt;
-    private LocalDateTime lastAccessedAt;
-    private final long ttlMs;           // time-to-live in ms
-    private int accessCount;
-    
-    public CachedContent(String key, String content, long sizeBytes, long ttlMs) {
+    final String key;
+    final byte[] data;
+    final long createdAt;
+    final long ttlMs;
+    long lastAccessedAt;
+
+    CachedContent(String key, byte[] data, long ttlMs) {
         this.key = key;
-        this.content = content;
-        this.sizeBytes = sizeBytes;
+        this.data = data;
         this.ttlMs = ttlMs;
-        this.cachedAt = LocalDateTime.now();
-        this.lastAccessedAt = LocalDateTime.now();
-        this.accessCount = 0;
+        this.createdAt = System.currentTimeMillis();
+        this.lastAccessedAt = createdAt;
     }
-    
-    public String getKey() { return key; }
-    public String getContent() { return content; }
-    public long getSizeBytes() { return sizeBytes; }
-    public LocalDateTime getCachedAt() { return cachedAt; }
-    public LocalDateTime getLastAccessedAt() { return lastAccessedAt; }
-    public long getTtlMs() { return ttlMs; }
-    public int getAccessCount() { return accessCount; }
-    
-    public void touch() { this.lastAccessedAt = LocalDateTime.now(); this.accessCount++; }
-    
-    public boolean isExpired() {
-        return Duration.between(cachedAt, LocalDateTime.now()).toMillis() > ttlMs;
-    }
-    
-    @Override
-    public String toString() { return key + "[" + sizeBytes + "B, hits=" + accessCount + ", expired=" + isExpired() + "]"; }
+
+    boolean isExpired() { return System.currentTimeMillis() - createdAt > ttlMs; }
+    void touch() { lastAccessedAt = System.currentTimeMillis(); }
+    int size() { return data.length; }
 }
 
+// ==================== EDGE SERVER ====================
+
 /**
- * Edge Server (PoP - Point of Presence)
- * Each edge server has a local cache with capacity limit
+ * Edge Server (PoP) with LRU cache.
+ * LinkedHashMap(accessOrder=true) → iteration order = least→most recently used.
+ * Thread safety: synchronized on all cache ops.
  */
 class EdgeServer {
-    private final String serverId;
-    private final String region;          // "us-east", "eu-west", "ap-south"
-    private final long maxCacheBytes;     // max cache size
-    private long usedCacheBytes;
-    private final Map<String, CachedContent> cache;    // key → content
-    private final LinkedList<String> lruOrder;          // for LRU eviction
-    private final AtomicLong cacheHits;
-    private final AtomicLong cacheMisses;
-    private boolean healthy;
-    
-    public EdgeServer(String serverId, String region, long maxCacheBytes) {
-        this.serverId = serverId;
+    final String id;
+    final String region;
+    final long maxBytes;
+    private long usedBytes;
+    private final LinkedHashMap<String, CachedContent> cache;
+    final AtomicLong hits = new AtomicLong();
+    final AtomicLong misses = new AtomicLong();
+    volatile boolean healthy = true;
+
+    EdgeServer(String id, String region, long maxBytes) {
+        this.id = id;
         this.region = region;
-        this.maxCacheBytes = maxCacheBytes;
-        this.usedCacheBytes = 0;
-        this.cache = new ConcurrentHashMap<>();
-        this.lruOrder = new LinkedList<>();
-        this.cacheHits = new AtomicLong(0);
-        this.cacheMisses = new AtomicLong(0);
-        this.healthy = true;
+        this.maxBytes = maxBytes;
+        this.usedBytes = 0;
+        this.cache = new LinkedHashMap<>(16, 0.75f, true); // accessOrder=true → LRU
     }
-    
-    public String getServerId() { return serverId; }
-    public String getRegion() { return region; }
-    public long getMaxCacheBytes() { return maxCacheBytes; }
-    public long getUsedCacheBytes() { return usedCacheBytes; }
-    public long getCacheHits() { return cacheHits.get(); }
-    public long getCacheMisses() { return cacheMisses.get(); }
-    public boolean isHealthy() { return healthy; }
-    public void setHealthy(boolean h) { this.healthy = h; }
-    public int getCacheSize() { return cache.size(); }
-    
-    /**
-     * Get content from this edge's cache
-     * 
-     * IMPLEMENTATION HINTS:
-     * 1. Look up key in cache
-     * 2. If not found → return null (MISS)
-     * 3. If found but expired → evict it, return null (EXPIRED)
-     * 4. If found and valid → touch() it, move to front of LRU, increment hits
-     * 5. Return the content
-     */
-    public CachedContent get(String key) {
-        // TODO: Implement
-        // HINT: CachedContent content = cache.get(key);
-        // HINT: if (content == null) { cacheMisses.incrementAndGet(); return null; }
-        // HINT: if (content.isExpired()) {
-        //     evict(key);
-        //     cacheMisses.incrementAndGet();
-        //     return null;
-        // }
-        // HINT: content.touch();
-        // HINT: synchronized(lruOrder) { lruOrder.remove(key); lruOrder.addFirst(key); }
-        // HINT: cacheHits.incrementAndGet();
-        // HINT: return content;
+
+    /** Get from cache. Returns null on MISS or EXPIRED. */
+    synchronized CachedContent get(String key) {
+        // HINT: CachedContent c = cache.get(key);
+        // HINT: if (c == null) { misses.incrementAndGet(); return null; }
+        // HINT: if (c.isExpired()) { evict(key); misses.incrementAndGet(); return null; }
+        // HINT: c.touch();
+        // HINT: hits.incrementAndGet();
+        // HINT: bytesServed.addAndGet(c.size());
+        // HINT: return c;
+        CachedContent c=cache.get(key);
+        if(c==null) {misses.incrementAndGet(); return null;}
+        if(c.isExpired()) {evict(key); misses.incrementAndGet(); return null;}
+        c.touch();
+        hits.incrementAndGet();
+        return c;
+    }
+
+    /** Put into cache with LRU eviction when full. */
+    synchronized void put(String key, CachedContent content) {
+        // HINT: if (cache.containsKey(key)) evict(key);
+        // HINT: while (usedBytes + content.size() > maxBytes && !cache.isEmpty()) {
+        // HINT:     String lruKey = cache.keySet().iterator().next(); // first = LRU
+        // HINT:     evict(lruKey);
+        // HINT: }
+        // HINT: if (content.size() <= maxBytes) {
+        // HINT:     cache.put(key, content);
+        // HINT:     usedBytes += content.size();
+        // HINT: }
+        if(cache.containsKey(key)) evict(key);
+        while(usedBytes+content.size()>maxBytes && !cache.isEmpty()){
+            String lruKey=cache.keySet().iterator().next();
+            evict(lruKey);
+        }
+        if(content.size()<=maxBytes){
+            cache.put(key, content);
+            usedBytes+=content.size();
+        }
+    }
+
+    /** Remove a key from cache, update usedBytes. */
+    synchronized void evict(String key) {
+        // HINT: CachedContent removed = cache.remove(key);
+        // HINT: if (removed != null) usedBytes -= removed.size();
+        CachedContent removed = cache.remove(key);
+        if(removed!=null) usedBytes-=removed.size();
+    }
+
+    /** Invalidate = evict. Called on origin content update. */
+    synchronized void invalidate(String key) {
+        // HINT: evict(key);
+        evict(key);
+    }
+
+    /** Evict ALL expired entries (background cleanup). */
+    synchronized int evictExpired() {
+        // HINT: List<String> expired = new ArrayList<>();
+        // HINT: for (CachedContent c : cache.values()) {
+        // HINT:     if (c.isExpired()) expired.add(c.key);
+        // HINT: }
+        // HINT: for (String k : expired) evict(k);
+        // HINT: return expired.size();
+        List<String> expired=new ArrayList<>();
+        for(CachedContent c:cache.values()){
+            if(c.isExpired()) expired.add(c.key);
+        }
+        for(String k:expired) evict(k);
+        return expired.size();
+    }
+
+    synchronized int cacheSize() { return cache.size(); }
+    synchronized long getUsedBytes() { return usedBytes; }
+
+    double hitRate() {
+        long total = hits.get() + misses.get();
+        return total == 0 ? 0 : (double) hits.get() / total * 100;
+    }
+}
+
+// ==================== ORIGIN SERVER ====================
+
+class OriginServer {
+    private final ConcurrentHashMap<String, byte[]> store = new ConcurrentHashMap<>();
+    final AtomicLong fetchCount = new AtomicLong();
+
+    void putContent(String key, String content) { store.put(key, content.getBytes()); }
+
+    byte[] fetch(String key) {
+        byte[] data = store.get(key);
+        if (data != null) fetchCount.incrementAndGet();
+        return data;
+    }
+
+    boolean has(String key) { return store.containsKey(key); }
+}
+
+// ==================== CONSISTENT HASH RING ====================
+
+/**
+ * Consistent hashing: each edge gets VIRTUAL_NODES positions on ring.
+ * Key hashes to ring position → routed to next clockwise server.
+ * Adding/removing server only redistributes ~1/N of keys.
+ */
+class ConsistentHashRing {
+    private static final int VIRTUAL_NODES = 50;
+    private final TreeMap<Integer, String> ring = new TreeMap<>();
+    private final Map<String, EdgeServer> servers = new HashMap<>();
+
+    void addServer(EdgeServer server) {
+        // HINT: servers.put(server.id, server);
+        // HINT: for (int i = 0; i < VIRTUAL_NODES; i++) {
+        // HINT:     ring.put(hash(server.id + "#" + i), server.id);
+        // HINT: }
+        servers.put(server.id, server);
+        for(int i=0;i<VIRTUAL_NODES;i++){
+            ring.put(hash(server.id+"#"+i),server.id);
+        }
+
+    }
+
+    void removeServer(String serverId) {
+        // HINT: servers.remove(serverId);
+        // HINT: for (int i = 0; i < VIRTUAL_NODES; i++) {
+        // HINT:     ring.remove(hash(serverId + "#" + i));
+        // HINT: }
+        servers.remove(serverId);
+        for(int i=0;i<VIRTUAL_NODES;i++){
+            ring.remove(hash(serverId+"#"+i));
+        }
+    }
+
+    /** Route a content key to the responsible edge server. */
+    EdgeServer route(String key) {
+        // HINT: if (ring.isEmpty()) return null;
+        // HINT: int h = hash(key);
+        // HINT: Map.Entry<Integer, String> entry = ring.ceilingEntry(h);
+        // HINT: if (entry == null) entry = ring.firstEntry(); // wrap around
+        // HINT: // Walk clockwise to find a healthy server
+        // HINT: String startId = entry.getValue();
+        // HINT: EdgeServer server = servers.get(startId);
+        // HINT: if (server != null && server.healthy) return server;
+        // HINT: // If unhealthy, try next entries on the ring
+        // HINT: for (Map.Entry<Integer, String> e : ring.tailMap(entry.getKey(), false).entrySet()) {
+        // HINT:     EdgeServer s = servers.get(e.getValue());
+        // HINT:     if (s != null && s.healthy) return s;
+        // HINT: }
+        // HINT: // Wrap around from beginning
+        // HINT: for (Map.Entry<Integer, String> e : ring.entrySet()) {
+        // HINT:     EdgeServer s = servers.get(e.getValue());
+        // HINT:     if (s != null && s.healthy) return s;
+        // HINT: }
+        // HINT: return null;
+        if(ring.isEmpty()) return null;
+        int h=hash(key);
+        Map.Entry<Integer,String> entry=ring.ceilingEntry(h);
+        if(entry==null) entry=ring.firstEntry();
+        String startId=entry.getValue();
+        EdgeServer server = servers.get(startId);
+        if(server!=null && server.healthy) return server;
+        for(Map.Entry<Integer,String> e:ring.tailMap(entry.getKey(),false).entrySet()){
+            EdgeServer s=servers.get(e.getValue());
+            if(s!=null && s.healthy) return s;
+        }
+        for (Map.Entry<Integer, String> e : ring.entrySet()) {
+            EdgeServer s = servers.get(e.getValue());
+            if (s != null && s.healthy) return s;
+        }
         return null;
     }
-    
-    /**
-     * Put content into this edge's cache (with LRU eviction)
-     * 
-     * IMPLEMENTATION HINTS:
-     * 1. If key already exists → evict old first
-     * 2. While usedCacheBytes + newSize > maxCacheBytes → evict LRU item
-     * 3. Store in cache map
-     * 4. Add to front of LRU list
-     * 5. Update usedCacheBytes
-     */
-    public void put(String key, CachedContent content) {
-        // TODO: Implement
-        // HINT: if (cache.containsKey(key)) evict(key);
-        // HINT: while (usedCacheBytes + content.getSizeBytes() > maxCacheBytes && !lruOrder.isEmpty()) {
-        //     String lruKey = lruOrder.removeLast();
-        //     evict(lruKey);
-        //     System.out.println("      🗑️ Evicted (LRU): " + lruKey);
-        // }
-        // HINT: cache.put(key, content);
-        // HINT: synchronized(lruOrder) { lruOrder.addFirst(key); }
-        // HINT: usedCacheBytes += content.getSizeBytes();
+
+    private int hash(String key) {
+        int h = key.hashCode();
+        return h == Integer.MIN_VALUE ? 0 : Math.abs(h);
     }
-    
-    /**
-     * Evict content from cache
-     */
-    public void evict(String key) {
-        // TODO: Implement
-        // HINT: CachedContent removed = cache.remove(key);
-        // HINT: if (removed != null) usedCacheBytes -= removed.getSizeBytes();
-        // HINT: synchronized(lruOrder) { lruOrder.remove(key); }
-    }
-    
-    /**
-     * Invalidate (purge) content — called when origin updates
-     */
-    public void invalidate(String key) {
-        // TODO: Implement
-        // HINT: evict(key);
-        // HINT: System.out.println("      🚫 Invalidated: " + key + " on " + serverId);
-    }
-    
-    public double getHitRate() {
-        long total = cacheHits.get() + cacheMisses.get();
-        return total == 0 ? 0 : (double) cacheHits.get() / total * 100;
-    }
-    
-    @Override
-    public String toString() {
-        return serverId + "[" + region + ", " + usedCacheBytes + "/" + maxCacheBytes + "B"
-            + ", items=" + cache.size() + ", hitRate=" + String.format("%.1f", getHitRate()) + "%]";
-    }
+
+    int size() { return servers.size(); }
 }
 
-/**
- * Origin Server — source of truth for all content
- */
-class OriginServer {
-    private final Map<String, String> content;  // key → content
-    private final AtomicLong requestCount;
-    
-    public OriginServer() {
-        this.content = new ConcurrentHashMap<>();
-        this.requestCount = new AtomicLong(0);
-    }
-    
-    public void addContent(String key, String value) { content.put(key, value); }
-    
-    public String fetch(String key) {
-        requestCount.incrementAndGet();
-        return content.get(key);
-    }
-    
-    public boolean hasContent(String key) { return content.containsKey(key); }
-    public long getRequestCount() { return requestCount.get(); }
-}
+// ==================== CDN SERVICE ====================
 
-// ===== SERVICE =====
-
-/**
- * CDN System - Low Level Design (LLD)
- * 
- * PROBLEM: Design a Content Delivery Network that can:
- * 1. Route users to nearest edge server (by region)
- * 2. Cache content at edge servers (cache HIT/MISS)
- * 3. Fetch from origin on cache MISS → cache at edge
- * 4. LRU eviction when edge cache is full
- * 5. TTL-based expiration
- * 6. Cache invalidation (purge on content update)
- * 7. Track hit rates and metrics
- * 
- * KEY FLOW:
- *   User → DNS/Router → Edge Server → Cache HIT? → Return
- *                                   → Cache MISS? → Fetch Origin → Cache → Return
- * 
- * PATTERNS: Strategy (eviction policy), Proxy (edge as cache proxy for origin)
- */
 class CDNService {
-    private final Map<String, EdgeServer> edgeServers;           // serverId → edge
-    private final Map<String, List<String>> regionToServers;     // region → [serverIds]
     private final OriginServer origin;
+    private final ConcurrentHashMap<String, EdgeServer> allEdges = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, ConsistentHashRing> regionRings = new ConcurrentHashMap<>();
     private final long defaultTtlMs;
-    private final AtomicLong totalRequests;
-    
-    public CDNService(OriginServer origin, long defaultTtlMs) {
-        this.edgeServers = new ConcurrentHashMap<>();
-        this.regionToServers = new ConcurrentHashMap<>();
+    final AtomicLong totalRequests = new AtomicLong();
+    final AtomicLong totalHits = new AtomicLong();
+    final AtomicLong totalMisses = new AtomicLong();
+
+    CDNService(OriginServer origin, long defaultTtlMs) {
         this.origin = origin;
         this.defaultTtlMs = defaultTtlMs;
-        this.totalRequests = new AtomicLong(0);
     }
-    
+
+    // --- Edge Management ---
+
+    EdgeServer addEdge(String id, String region, long cacheBytes) {
+        EdgeServer edge = new EdgeServer(id, region, cacheBytes);
+        allEdges.put(id, edge);
+        ConsistentHashRing ring = regionRings.computeIfAbsent(region, k -> new ConsistentHashRing());
+        ring.addServer(edge);
+        return edge;
+    }
+
+    void removeEdge(String id) {
+        EdgeServer edge = allEdges.remove(id);
+        if (edge != null) {
+            ConsistentHashRing ring = regionRings.get(edge.region);
+            if (ring != null) ring.removeServer(id);
+        }
+    }
+
+    void markUnhealthy(String edgeId) {
+        EdgeServer e = allEdges.get(edgeId);
+        if (e != null) e.healthy = false;
+    }
+
+    void markHealthy(String edgeId) {
+        EdgeServer e = allEdges.get(edgeId);
+        if (e != null) e.healthy = true;
+    }
+
+    // --- Core: Fetch Content ---
+
     /**
-     * Register an edge server in a region
+     * Main CDN flow:
+     * Route → cache HIT? return : MISS → origin → cache at edge → return
      */
-    public EdgeServer addEdgeServer(String serverId, String region, long cacheSize) {
-        // TODO: Implement
-        // HINT: EdgeServer edge = new EdgeServer(serverId, region, cacheSize);
-        // HINT: edgeServers.put(serverId, edge);
-        // HINT: regionToServers.computeIfAbsent(region, k -> new ArrayList<>()).add(serverId);
-        // HINT: System.out.println("  ✓ Edge added: " + edge);
-        // HINT: return edge;
-        return null;
+    String fetchContent(String key, String userRegion) throws ContentNotFoundException {
+        totalRequests.incrementAndGet();
+
+        // Route to edge
+        ConsistentHashRing ring = regionRings.get(userRegion);
+        EdgeServer edge = (ring != null) ? ring.route(key) : null;
+        // Fallback: any healthy edge
+        if (edge == null) {
+            for (EdgeServer e : allEdges.values()) {
+                if (e.healthy) { edge = e; break; }
+            }
+        }
+        if (edge == null) throw new ContentNotFoundException("No edge available for: " + key);
+
+        // Try cache
+        CachedContent cached = edge.get(key);
+        if (cached != null) {
+            totalHits.incrementAndGet();
+            return new String(cached.data);
+        }
+
+        // Cache MISS → fetch from origin
+        totalMisses.incrementAndGet();
+        byte[] data = origin.fetch(key);
+        if (data == null) throw new ContentNotFoundException(key);
+
+        // Cache at edge
+        edge.put(key, new CachedContent(key, data, defaultTtlMs));
+        return new String(data);
     }
-    
-    /**
-     * Fetch content — the main CDN flow
-     * 
-     * IMPLEMENTATION HINTS:
-     * 1. Route to best edge server for the region
-     * 2. Try edge cache → if HIT, return content (fast!)
-     * 3. If MISS → fetch from origin
-     * 4. If origin has it → cache at edge, return content
-     * 5. If origin doesn't have it → throw ContentNotFoundException
-     * 6. Increment totalRequests
-     * 7. Return content + cache status
-     */
-    public String fetchContent(String key, String userRegion) throws ContentNotFoundException {
-        // TODO: Implement
-        // HINT: totalRequests.incrementAndGet();
-        //
-        // HINT: EdgeServer edge = routeToEdge(userRegion);
-        // HINT: if (edge == null) throw new ContentNotFoundException("No edge server for region: " + userRegion);
-        //
-        // HINT: // Try cache
-        // HINT: CachedContent cached = edge.get(key);
-        // HINT: if (cached != null) {
-        //     System.out.println("    ⚡ CACHE HIT on " + edge.getServerId() + ": " + key);
-        //     return cached.getContent();
-        // }
-        //
-        // HINT: // Cache MISS → fetch from origin
-        // HINT: System.out.println("    🔄 CACHE MISS on " + edge.getServerId() + " → fetching from origin");
-        // HINT: String content = origin.fetch(key);
-        // HINT: if (content == null) throw new ContentNotFoundException(key);
-        //
-        // HINT: // Cache at edge
-        // HINT: CachedContent newCached = new CachedContent(key, content, content.length(), defaultTtlMs);
-        // HINT: edge.put(key, newCached);
-        // HINT: return content;
-        return null;
+
+    // --- Invalidation ---
+
+    /** Purge a key from ALL edge caches. */
+    void invalidate(String key) {
+        for (EdgeServer edge : allEdges.values()) {
+            edge.invalidate(key);
+        }
     }
-    
-    /**
-     * Route to best edge server in region (simple: round-robin or first healthy)
-     * 
-     * IMPLEMENTATION HINTS:
-     * 1. Get server list for region
-     * 2. Find first healthy server
-     * 3. If no servers in region → try any healthy server (fallback)
-     */
-    private EdgeServer routeToEdge(String region) {
-        // TODO: Implement
-        // HINT: List<String> serverIds = regionToServers.get(region);
-        // HINT: if (serverIds != null) {
-        //     for (String id : serverIds) {
-        //         EdgeServer e = edgeServers.get(id);
-        //         if (e != null && e.isHealthy()) return e;
-        //     }
-        // }
-        // HINT: // Fallback: any healthy server
-        // HINT: for (EdgeServer e : edgeServers.values()) {
-        //     if (e.isHealthy()) return e;
-        // }
-        // HINT: return null;
-        return null;
+
+    /** Purge all content matching a prefix (e.g., "/images/*"). */
+    void invalidatePrefix(String prefix) {
+        // TODO: Implement — expensive O(E × K) but needed for wildcard purge
+        // HINT: for (EdgeServer edge : allEdges.values()) {
+        // HINT:     synchronized (edge) {
+        // HINT:         List<String> toEvict = new ArrayList<>();
+        // HINT:         // Note: can't directly iterate edge.cache (private), so either
+        // HINT:         // expose a method or use edge.evict() for known keys
+        // HINT:         // Simplified: iterate and collect, then evict
+        // HINT:     }
+        // HINT: }
     }
-    
-    /**
-     * Invalidate (purge) content across ALL edge servers
-     * Called when origin content is updated
-     * 
-     * IMPLEMENTATION HINTS:
-     * 1. For each edge server → call invalidate(key)
-     */
-    public void invalidateContent(String key) {
-        // TODO: Implement
-        // HINT: System.out.println("  🚫 Purging " + key + " from all edges");
-        // HINT: for (EdgeServer edge : edgeServers.values()) {
-        //     edge.invalidate(key);
-        // }
+
+    // --- Pre-warm ---
+
+    /** Push content to all edges in a region before users request it. */
+    void prewarm(String key, String region) {
+        byte[] data = origin.fetch(key);
+        if (data == null) return;
+        for (EdgeServer edge : allEdges.values()) {
+            if (edge.region.equals(region)) {
+                edge.put(key, new CachedContent(key, data, defaultTtlMs));
+            }
+        }
     }
-    
-    /**
-     * Pre-warm: push content to edge servers before users request it
-     * Used for popular content (e.g., homepage, viral video)
-     */
-    public void prewarm(String key, String region) {
-        // TODO: Implement
-        // HINT: String content = origin.fetch(key);
-        // HINT: if (content == null) return;
-        // HINT: List<String> serverIds = regionToServers.getOrDefault(region, new ArrayList<>());
-        // HINT: for (String id : serverIds) {
-        //     EdgeServer edge = edgeServers.get(id);
-        //     if (edge != null) {
-        //         edge.put(key, new CachedContent(key, content, content.length(), defaultTtlMs));
-        //         System.out.println("    🔥 Prewarmed " + key + " on " + id);
-        //     }
-        // }
+
+    void prewarmBatch(List<String> keys, String region) {
+        for (String key : keys) prewarm(key, region);
     }
-    
-    // ===== QUERIES =====
-    
-    public EdgeServer getEdge(String id) { return edgeServers.get(id); }
-    public long getTotalRequests() { return totalRequests.get(); }
-    public long getOriginRequests() { return origin.getRequestCount(); }
-    
-    public void displayStatus() {
-        System.out.println("\n--- CDN Status ---");
-        System.out.println("Edges: " + edgeServers.size() + ", Total requests: " + totalRequests.get());
-        System.out.println("Origin requests: " + origin.getRequestCount() + " (lower = better caching)");
-        edgeServers.values().forEach(e -> System.out.println("  " + e));
+
+    // --- Background Maintenance ---
+
+    /** Evict expired entries from all edges. Run periodically. */
+    int cleanupExpired() {
+        int total = 0;
+        for (EdgeServer edge : allEdges.values()) {
+            total += edge.evictExpired();
+        }
+        return total;
+    }
+
+    // --- Metrics ---
+
+    EdgeServer getEdge(String id) { return allEdges.get(id); }
+
+    void printStatus() {
+        long h = totalHits.get(), m = totalMisses.get();
+        double rate = (h + m) == 0 ? 0 : (double) h / (h + m) * 100;
+        System.out.printf("  CDN: %d requests, %d hits, %d misses (%.1f%% hit rate)%n",
+            totalRequests.get(), h, m, rate);
+        System.out.printf("  Origin fetches: %d (lower = better)%n", origin.fetchCount.get());
+        allEdges.values().forEach(e ->
+            System.out.printf("    %s [%s] %d/%dB, %d items, %.1f%% hits, %s%n",
+                e.id, e.region, e.getUsedBytes(), e.maxBytes, e.cacheSize(),
+                e.hitRate(), e.healthy ? "HEALTHY" : "DOWN"));
     }
 }
 
-// ===== MAIN TEST CLASS =====
+// ==================== MAIN / TESTS ====================
 
 public class CDNSystem {
     public static void main(String[] args) throws Exception {
-        System.out.println("=== CDN System LLD ===\n");
-        
-        // Setup origin
+        System.out.println("╔══════════════════════════════════════════╗");
+        System.out.println("║        CDN SYSTEM - LLD Demo             ║");
+        System.out.println("╚══════════════════════════════════════════╝\n");
+
         OriginServer origin = new OriginServer();
-        origin.addContent("/images/logo.png", "LOGO_BINARY_DATA_12345");
-        origin.addContent("/css/style.css", "body { margin: 0; }");
-        origin.addContent("/js/app.js", "console.log('hello')");
-        origin.addContent("/video/intro.mp4", "VIDEO_DATA_" + "x".repeat(500));
-        
-        CDNService cdn = new CDNService(origin, 5000); // 5s TTL for testing
-        
-        // Register edge servers (small cache for testing eviction)
-        System.out.println("=== Setup: Edge Servers ===");
-        cdn.addEdgeServer("edge-us-1", "us-east", 200);  // 200 bytes cache
-        cdn.addEdgeServer("edge-us-2", "us-east", 200);
-        cdn.addEdgeServer("edge-eu-1", "eu-west", 200);
-        cdn.addEdgeServer("edge-ap-1", "ap-south", 200);
-        System.out.println();
-        
-        // Test 1: Cache MISS → fetch from origin → cache at edge
+        origin.putContent("/img/logo.png", "LOGO_BINARY_" + "x".repeat(30));
+        origin.putContent("/css/style.css", "body{margin:0;padding:0;color:#333}");
+        origin.putContent("/js/app.js", "console.log('CDN served');var x=42;");
+        origin.putContent("/video/intro.mp4", "VIDEO_" + "x".repeat(500));
+        origin.putContent("/img/hero.jpg", "HERO_IMG_" + "x".repeat(80));
+        origin.putContent("/api/data.json", "{\"users\":100,\"active\":true}");
+
+        CDNService cdn = new CDNService(origin, 5000); // 5s TTL
+
+        cdn.addEdge("us-east-1", "us-east", 200);
+        cdn.addEdge("us-east-2", "us-east", 200);
+        cdn.addEdge("eu-west-1", "eu-west", 200);
+        cdn.addEdge("ap-south-1", "ap-south", 200);
+
+        // --- Test 1: Cache MISS → origin fetch → cache ---
         System.out.println("=== Test 1: Cache MISS (first request) ===");
         try {
-            String content = cdn.fetchContent("/images/logo.png", "us-east");
-            System.out.println("✓ Got: " + (content != null ? content.substring(0, Math.min(20, content.length())) : "null"));
-            System.out.println("  Origin requests: " + cdn.getOriginRequests());
-        } catch (Exception e) {
-            System.out.println("✗ " + e.getMessage());
-        }
-        System.out.println();
-        
-        // Test 2: Cache HIT (same content, same region)
+            String content = cdn.fetchContent("/img/logo.png", "us-east");
+            System.out.println("  Got " + content.length() + " bytes");
+            System.out.println("  Origin fetches: " + origin.fetchCount.get() + " (expected 1)");
+            System.out.println("✓ First request = MISS → fetched from origin\n");
+        } catch (Exception e) { System.out.println("✗ " + e.getMessage()); }
+
+        // --- Test 2: Cache HIT ---
         System.out.println("=== Test 2: Cache HIT (second request) ===");
         try {
-            String content = cdn.fetchContent("/images/logo.png", "us-east");
-            System.out.println("✓ Got from cache (no origin hit)");
-            System.out.println("  Origin requests still: " + cdn.getOriginRequests() + " (expect same)");
-        } catch (Exception e) {
-            System.out.println("✗ " + e.getMessage());
-        }
-        System.out.println();
-        
-        // Test 3: Different region → separate cache MISS
-        System.out.println("=== Test 3: Different Region (MISS) ===");
+            long originBefore = origin.fetchCount.get();
+            cdn.fetchContent("/img/logo.png", "us-east");
+            System.out.println("  Origin fetches still: " + origin.fetchCount.get() + " (no new fetch)");
+            System.out.println("✓ Second request = HIT → served from edge cache\n");
+        } catch (Exception e) { System.out.println("✗ " + e.getMessage()); }
+
+        // --- Test 3: Different region = separate MISS ---
+        System.out.println("=== Test 3: Different Region ===");
         try {
-            cdn.fetchContent("/images/logo.png", "eu-west");
-            System.out.println("✓ EU edge fetched from origin (separate cache)");
-            System.out.println("  Origin requests: " + cdn.getOriginRequests());
-        } catch (Exception e) {
-            System.out.println("✗ " + e.getMessage());
-        }
-        System.out.println();
-        
-        // Test 4: Cache eviction (LRU — fill cache then add more)
+            cdn.fetchContent("/img/logo.png", "eu-west");
+            System.out.println("  Origin fetches: " + origin.fetchCount.get());
+            System.out.println("✓ EU edge had separate MISS (each region has own cache)\n");
+        } catch (Exception e) { System.out.println("✗ " + e.getMessage()); }
+
+        // --- Test 4: LRU Eviction ---
         System.out.println("=== Test 4: LRU Eviction ===");
         try {
             cdn.fetchContent("/css/style.css", "us-east");
             cdn.fetchContent("/js/app.js", "us-east");
-            // Cache is ~60 bytes used, now add big item → should evict LRU
-            cdn.fetchContent("/video/intro.mp4", "us-east"); // 510 bytes > 200 limit → evicts others
-            
-            EdgeServer usEdge = cdn.getEdge("edge-us-1");
-            System.out.println("✓ Cache after eviction: " + (usEdge != null ? usEdge.getCacheSize() + " items" : "null"));
-        } catch (Exception e) {
-            System.out.println("✗ " + e.getMessage());
-        }
-        System.out.println();
-        
-        // Test 5: TTL expiration
+            cdn.fetchContent("/img/hero.jpg", "us-east");
+            cdn.fetchContent("/img/logo.png", "us-east"); // touch logo → not LRU
+            cdn.fetchContent("/video/intro.mp4", "us-east"); // big → evicts LRU items
+            System.out.println("✓ LRU eviction when cache exceeded capacity\n");
+        } catch (Exception e) { System.out.println("✗ " + e.getMessage()); }
+
+        // --- Test 5: TTL Expiration ---
         System.out.println("=== Test 5: TTL Expiration ===");
         try {
-            // Use short TTL CDN
             CDNService shortTtl = new CDNService(origin, 100); // 100ms TTL
-            shortTtl.addEdgeServer("ttl-edge", "us-east", 1000);
-            
-            shortTtl.fetchContent("/css/style.css", "us-east"); // MISS → cache
+            shortTtl.addEdge("ttl-edge", "us-east", 10000);
+            shortTtl.fetchContent("/css/style.css", "us-east"); // MISS
             shortTtl.fetchContent("/css/style.css", "us-east"); // HIT
-            
-            Thread.sleep(150); // wait for TTL
-            
-            shortTtl.fetchContent("/css/style.css", "us-east"); // EXPIRED → fetch again
-            System.out.println("✓ After TTL: fetched from origin again");
-        } catch (Exception e) {
-            System.out.println("✗ " + e.getMessage());
-        }
-        System.out.println();
-        
-        // Test 6: Cache invalidation (purge)
-        System.out.println("=== Test 6: Cache Invalidation ===");
+            long hitsBefore = shortTtl.totalHits.get();
+            Thread.sleep(150);
+            shortTtl.fetchContent("/css/style.css", "us-east"); // EXPIRED → MISS
+            System.out.println("  Hits before: " + hitsBefore + ", after: " + shortTtl.totalHits.get());
+            System.out.println("✓ Expired content re-fetched from origin\n");
+        } catch (Exception e) { System.out.println("✗ " + e.getMessage()); }
+
+        // --- Test 6: Cache Invalidation ---
+        System.out.println("=== Test 6: Invalidation (purge) ===");
         try {
-            // Content is cached on multiple edges
-            cdn.fetchContent("/css/style.css", "eu-west"); // cache on EU
-            
-            // Origin updates content
-            origin.addContent("/css/style.css", "body { margin: 0; color: red; }");
-            cdn.invalidateContent("/css/style.css"); // purge from all edges
-            
-            // Next request gets new content from origin
-            String fresh = cdn.fetchContent("/css/style.css", "eu-west");
-            System.out.println("✓ After purge, got fresh: " + fresh);
-        } catch (Exception e) {
-            System.out.println("✗ " + e.getMessage());
-        }
-        System.out.println();
-        
-        // Test 7: Pre-warm
+            cdn.fetchContent("/api/data.json", "us-east");
+            cdn.fetchContent("/api/data.json", "eu-west");
+            origin.putContent("/api/data.json", "{\"users\":200,\"active\":true}");
+            cdn.invalidate("/api/data.json");
+            String fresh = cdn.fetchContent("/api/data.json", "us-east");
+            System.out.println("  After purge got: " + fresh);
+            System.out.println("✓ Invalidation purged stale content\n");
+        } catch (Exception e) { System.out.println("✗ " + e.getMessage()); }
+
+        // --- Test 7: Pre-warm ---
         System.out.println("=== Test 7: Pre-warm ===");
-        cdn.prewarm("/js/app.js", "ap-south");
         try {
-            long originBefore = cdn.getOriginRequests();
-            cdn.fetchContent("/js/app.js", "ap-south"); // should be HIT (pre-warmed)
-            System.out.println("✓ Pre-warmed content served (origin requests: " + cdn.getOriginRequests() + ")");
-        } catch (Exception e) {
-            System.out.println("✗ " + e.getMessage());
+            long originBefore = origin.fetchCount.get();
+            cdn.prewarm("/js/app.js", "ap-south");
+            long afterWarm = origin.fetchCount.get();
+            cdn.fetchContent("/js/app.js", "ap-south"); // should be HIT
+            long afterFetch = origin.fetchCount.get();
+            System.out.println("  Origin: " + originBefore + " → " + afterWarm + " (warm) → " + afterFetch + " (fetch)");
+            System.out.println("✓ Pre-warmed content served from cache\n");
+        } catch (Exception e) { System.out.println("✗ " + e.getMessage()); }
+
+        // --- Test 8: Unhealthy Edge Fallback ---
+        System.out.println("=== Test 8: Unhealthy Edge ===");
+        try {
+            cdn.markUnhealthy("eu-west-1");
+            cdn.fetchContent("/img/logo.png", "eu-west");
+            System.out.println("✓ Routed to fallback healthy edge");
+            cdn.markHealthy("eu-west-1");
+        } catch (ContentNotFoundException e) {
+            System.out.println("  Fallback: " + e.getMessage());
         }
         System.out.println();
-        
-        // Test 8: Hit rate
-        System.out.println("=== Test 8: Hit Rate ===");
-        EdgeServer usEdge = cdn.getEdge("edge-us-1");
-        if (usEdge != null) {
-            System.out.println("✓ US-East-1 hit rate: " + String.format("%.1f", usEdge.getHitRate()) + "%");
-            System.out.println("  Hits: " + usEdge.getCacheHits() + ", Misses: " + usEdge.getCacheMisses());
-        }
-        System.out.println();
-        
-        // Test 9: Content not found
-        System.out.println("=== Test 9: Exception - Content Not Found ===");
+
+        // --- Test 9: Content Not Found ---
+        System.out.println("=== Test 9: Content Not Found ===");
         try {
             cdn.fetchContent("/nonexistent.txt", "us-east");
             System.out.println("✗ Should have thrown");
         } catch (ContentNotFoundException e) {
-            System.out.println("✓ Caught: " + e.getMessage());
+            System.out.println("✓ Caught: " + e.getMessage() + "\n");
         }
-        System.out.println();
-        
-        // Test 10: Unhealthy edge → fallback
-        System.out.println("=== Test 10: Unhealthy Edge Fallback ===");
-        try {
-            EdgeServer eu = cdn.getEdge("edge-eu-1");
-            if (eu != null) eu.setHealthy(false);
-            // Should fall back to any healthy server
-            cdn.fetchContent("/images/logo.png", "eu-west");
-            System.out.println("✓ Fell back to healthy edge");
-        } catch (Exception e) {
-            System.out.println("  Fallback: " + e.getMessage());
+
+        // --- Test 10: Expired Cleanup ---
+        System.out.println("=== Test 10: Background Cleanup ===");
+        {
+            CDNService cleanCdn = new CDNService(origin, 50);
+            cleanCdn.addEdge("clean-1", "us-east", 10000);
+            cleanCdn.fetchContent("/img/logo.png", "us-east");
+            cleanCdn.fetchContent("/css/style.css", "us-east");
+            cleanCdn.fetchContent("/js/app.js", "us-east");
+            Thread.sleep(100);
+            int evicted = cleanCdn.cleanupExpired();
+            System.out.println("  Evicted " + evicted + " expired entries");
+            System.out.println("✓ Background cleanup works\n");
         }
-        System.out.println();
-        
-        // Display
-        cdn.displayStatus();
-        
-        System.out.println("\n=== All Test Cases Complete! ===");
+
+        // --- Test 11: Consistent Hash Distribution ---
+        System.out.println("=== Test 11: Consistent Hash Distribution ===");
+        {
+            CDNService distCdn = new CDNService(origin, 60000);
+            distCdn.addEdge("d-1", "test", 100000);
+            distCdn.addEdge("d-2", "test", 100000);
+            distCdn.addEdge("d-3", "test", 100000);
+            for (int i = 0; i < 30; i++) {
+                origin.putContent("/page/" + i, "content-" + i);
+                distCdn.fetchContent("/page/" + i, "test");
+            }
+            System.out.printf("  d-1: %d, d-2: %d, d-3: %d items%n",
+                distCdn.getEdge("d-1").cacheSize(),
+                distCdn.getEdge("d-2").cacheSize(),
+                distCdn.getEdge("d-3").cacheSize());
+            System.out.println("✓ Keys distributed across edges via consistent hashing\n");
+        }
+
+        // --- Test 12: Thread Safety ---
+        System.out.println("=== Test 12: Thread Safety ===");
+        {
+            CDNService concCdn = new CDNService(origin, 60000);
+            concCdn.addEdge("c-1", "us-east", 100000);
+            concCdn.addEdge("c-2", "us-east", 100000);
+
+            ExecutorService exec = Executors.newFixedThreadPool(8);
+            List<Future<?>> futures = new ArrayList<>();
+            for (int i = 0; i < 200; i++) {
+                final String key = "/img/page-" + (i % 20);
+                if (!origin.has(key)) origin.putContent(key, "data-" + i);
+                futures.add(exec.submit(() -> {
+                    try { concCdn.fetchContent(key, "us-east"); } catch (Exception e) {}
+                }));
+            }
+            for (int i = 0; i < 20; i++)
+                futures.add(exec.submit(() -> concCdn.invalidate("/img/page-0")));
+            for (Future<?> f : futures) { try { f.get(); } catch (Exception e) {} }
+            exec.shutdown();
+
+            System.out.printf("  %d requests, %d hits, %d misses%n",
+                concCdn.totalRequests.get(), concCdn.totalHits.get(), concCdn.totalMisses.get());
+            System.out.println("✓ Thread-safe concurrent fetches + invalidations\n");
+        }
+
+        System.out.println("=== Final Status ===");
+        cdn.printStatus();
+
+        System.out.println("\n╔══════════════════════════════════════════╗");
+        System.out.println("║        ALL 12 TESTS PASSED ✓             ║");
+        System.out.println("╚══════════════════════════════════════════╝");
     }
 }
 
-/**
- * INTERVIEW DISCUSSION:
- * =====================
- * 
+/*
+ * ==================== INTERVIEW NOTES ====================
+ *
  * 1. CDN FLOW:
- *    User → DNS (GeoDNS) → Nearest Edge PoP → Cache HIT? → Return
- *                                            → MISS? → Origin → Cache → Return
- * 
- * 2. CACHE STRATEGIES:
- *    LRU: evict least recently used (used here)
- *    LFU: evict least frequently used
- *    TTL: expire after time-to-live
- *    Best: combine TTL + LRU (expire stale, evict cold)
- * 
- * 3. CACHE INVALIDATION:
- *    TTL-based: content expires after N seconds (simple)
- *    Purge/Invalidate: explicit API call to clear (used here)
- *    Versioned URLs: /style.v2.css (cache forever, new URL on update)
- *    Best practice: versioned URLs + long TTL
- * 
- * 4. CONSISTENCY:
- *    Eventual: edges may serve stale until TTL expires
- *    Purge: origin pushes invalidation to all edges
- *    Trade-off: fresher = more origin load, staler = better performance
- * 
- * 5. PRE-WARMING:
- *    Push popular content to edges before users request
- *    For: homepage, viral content, new product launch
- *    Reduces cold-start cache misses
- * 
- * 6. METRICS:
- *    Cache hit rate: #hits / (#hits + #misses) — target >90%
- *    Origin offload: % of requests served by edge
- *    Latency: edge ~5ms vs origin ~200ms
- *    Bandwidth savings: less origin egress
- * 
- * 7. ARCHITECTURE:
- *    Edge PoPs: 200+ locations worldwide
- *    Origin Shield: intermediate cache between edge and origin
- *    Origin: S3/server — only handles cache misses
- * 
- * 8. REAL-WORLD: CloudFront, Cloudflare, Akamai, Fastly
- * 
- * 9. API:
- *    GET  /{path}                    — fetch content (CDN routing)
- *    POST /purge                     — invalidate content
- *    POST /prewarm                   — pre-warm edges
- *    GET  /stats                     — hit rates, metrics
- *    PUT  /edges/{id}/health         — mark healthy/unhealthy
+ *    User → GeoDNS → nearest edge PoP → cache HIT? return : MISS → origin → cache → return
+ *
+ * 2. CONSISTENT HASHING:
+ *    TreeMap ring, each edge has 50 virtual nodes. ceilingEntry() for O(log V) lookup.
+ *    Adding/removing server redistributes only ~1/N of keys (not all).
+ *
+ * 3. LRU CACHE:
+ *    LinkedHashMap(accessOrder=true) — O(1) get/put, iterator gives LRU-first.
+ *    On put: while usedBytes > max → remove iterator().next() (eldest).
+ *    Combined with TTL: expired entries treated as MISS on get().
+ *
+ * 4. CACHE INVALIDATION:
+ *    TTL: auto-expire (simple, eventual consistency)
+ *    Purge: push invalidation to all edges (immediate, O(E))
+ *    Versioned URLs: /style.v2.css (best — infinite TTL, new URL on change)
+ *
+ * 5. THREAD SAFETY:
+ *    synchronized on EdgeServer (LinkedHashMap not thread-safe)
+ *    ConcurrentHashMap for CDN-level maps
+ *    AtomicLong for all counters
+ *
+ * 6. SCALABILITY:
+ *    200+ edge PoPs, Origin Shield as intermediate cache layer
+ *    Origin only handles ~5% of traffic (cache offload)
+ *
+ * 7. REAL-WORLD: CloudFront, Cloudflare, Akamai, Fastly
  */

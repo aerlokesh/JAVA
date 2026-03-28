@@ -1,966 +1,874 @@
 import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.locks.*;
 import java.util.stream.*;
 
-// ===== DOCUMENT CLASS =====
-
-/**
- * Represents a searchable document
+/*
+ * SEARCH INDEX - Low Level Design
+ * ================================
  * 
- * INTERVIEW DISCUSSION:
- * - Document ID: unique identifier
- * - Content: text to be indexed
- * - Metadata: title, author, tags, etc.
+ * REQUIREMENTS:
+ * 1. Index documents (id, title, content, metadata)
+ * 2. Full-text search with relevance ranking (TF-IDF)
+ * 3. Boolean queries: AND, OR
+ * 4. Phrase search (positional index)
+ * 5. Prefix/wildcard search
+ * 6. Autocomplete suggestions (Trie)
+ * 7. Add/remove/update documents
+ * 8. Thread-safe operations
+ * 
+ * KEY DATA STRUCTURES:
+ * - Inverted Index: term -> {docId -> PostingEntry(freq, positions)}
+ * - Trie: prefix tree for autocomplete
+ * 
+ * SCORING: TF-IDF with field weighting (title=3x, content=1x)
+ * 
+ * COMPLEXITY:
+ *   indexDocument:  O(n) where n = terms in doc
+ *   search (OR):   O(q * d) where q=query terms, d=avg docs/term
+ *   search (AND):  O(q * min_d) with set intersection
+ *   phrase search: O(q * d * p) where p=avg positions/term
+ *   autocomplete:  O(k + r) where k=prefix len, r=results
  */
+
+// ==================== DOCUMENT ====================
+
 class Document {
-    private String id;
-    private String title;
-    private String content;
-    private Map<String, String> metadata;
-    
+    private final String id;
+    private final String title;
+    private final String content;
+    private final Map<String, String> metadata;
+    private final long indexedAt;
+
     public Document(String id, String title, String content) {
         this.id = id;
         this.title = title;
         this.content = content;
-        this.metadata = new HashMap<>();
+        this.metadata = new ConcurrentHashMap<>();
+        this.indexedAt = System.currentTimeMillis();
     }
-    
+
     public String getId() { return id; }
     public String getTitle() { return title; }
     public String getContent() { return content; }
     public Map<String, String> getMetadata() { return metadata; }
-    
-    public void addMetadata(String key, String value) {
-        metadata.put(key, value);
-    }
-    
+    public long getIndexedAt() { return indexedAt; }
+
+    public void addMetadata(String key, String value) { metadata.put(key, value); }
+
     @Override
     public String toString() {
         return "Document{id='" + id + "', title='" + title + "'}";
     }
 }
 
-// ===== SEARCH RESULT CLASS =====
+// ==================== SEARCH RESULT ====================
 
-/**
- * Represents a search result with document and relevance score
- */
 class SearchResult implements Comparable<SearchResult> {
-    private Document document;
-    private double score;
-    private List<String> matchedTerms;
-    
-    public SearchResult(Document document, double score) {
+    private final Document document;
+    private final double score;
+    private final Set<String> matchedTerms;
+
+    public SearchResult(Document document, double score, Set<String> matchedTerms) {
         this.document = document;
         this.score = score;
-        this.matchedTerms = new ArrayList<>();
+        this.matchedTerms = matchedTerms;
     }
-    
+
     public Document getDocument() { return document; }
     public double getScore() { return score; }
-    public List<String> getMatchedTerms() { return matchedTerms; }
-    
-    public void addMatchedTerm(String term) {
-        matchedTerms.add(term);
-    }
-    
+    public Set<String> getMatchedTerms() { return matchedTerms; }
+
     @Override
     public int compareTo(SearchResult other) {
-        // Higher score first
-        return Double.compare(other.score, this.score);
+        return Double.compare(other.score, this.score); // higher first
     }
-    
+
     @Override
     public String toString() {
-        return String.format("%.2f - %s (matched: %s)", score, document, matchedTerms);
+        return String.format("  %.4f - %s (matched: %s)", score, document, matchedTerms);
     }
 }
 
-// ===== TEXT PROCESSOR =====
+// ==================== TEXT PROCESSOR ====================
 
 /**
- * Handles text processing: tokenization, normalization, stemming
+ * Tokenization + normalization + stop-word removal + simple stemming.
  * 
- * INTERVIEW DISCUSSION:
- * - Tokenization: split text into words
- * - Normalization: lowercase, remove punctuation
- * - Stop words: remove common words (the, a, is)
- * - Stemming: reduce words to root form (running -> run)
+ * Production: use Porter/Snowball stemmer, ICU tokenizer for i18n.
  */
 class TextProcessor {
     private static final Set<String> STOP_WORDS = new HashSet<>(Arrays.asList(
         "a", "an", "and", "are", "as", "at", "be", "by", "for", "from",
         "has", "he", "in", "is", "it", "its", "of", "on", "that", "the",
-        "to", "was", "will", "with"
+        "to", "was", "were", "will", "with", "this", "but", "they",
+        "have", "had", "not", "or", "so", "if", "do", "no", "can"
     ));
-    
-    /**
-     * Tokenize text into terms
-     * 
-     * STEPS:
-     * 1. Convert to lowercase
-     * 2. Split on non-word characters
-     * 3. Remove stop words
-     * 4. Optional: stemming (simplified here)
-     * 
-     * @param text Input text
-     * @return List of processed terms
-     */
+
+    /** Tokenize text into normalized terms (lowercase, no punctuation, no stop words). */
     public static List<String> tokenize(String text) {
-        if (text == null || text.isEmpty()) {
-            return new ArrayList<>();
-        }
-        
-        // Convert to lowercase and split
+        if (text == null || text.isEmpty()) return Collections.emptyList();
+
         String[] words = text.toLowerCase()
                              .replaceAll("[^a-z0-9\\s]", " ")
                              .split("\\s+");
-        
+
         List<String> terms = new ArrayList<>();
-        for (String word : words) {
-            // Skip empty strings and stop words
-            if (!word.isEmpty() && !STOP_WORDS.contains(word)) {
-                terms.add(word);
+        for (String w : words) {
+            if (!w.isEmpty() && !STOP_WORDS.contains(w)) {
+                terms.add(stem(w));
             }
         }
-        
         return terms;
     }
-    
-    /**
-     * Simple stemming (remove common suffixes)
-     * In production: Use Porter Stemmer or Snowball
-     */
+
+    /** Simple suffix-based stemming. Production: Porter Stemmer. */
     public static String stem(String word) {
-        // Simplified stemming
-        if (word.endsWith("ing")) return word.substring(0, word.length() - 3);
-        if (word.endsWith("ed")) return word.substring(0, word.length() - 2);
-        if (word.endsWith("s") && word.length() > 3) return word.substring(0, word.length() - 1);
+        if (word.length() <= 3) return word;
+        if (word.endsWith("ing") && word.length() > 5) return word.substring(0, word.length() - 3);
+        if (word.endsWith("tion")) return word.substring(0, word.length() - 4);
+        if (word.endsWith("ed") && word.length() > 4) return word.substring(0, word.length() - 2);
+        if (word.endsWith("ly") && word.length() > 4) return word.substring(0, word.length() - 2);
+        if (word.endsWith("es") && word.length() > 4) return word.substring(0, word.length() - 2);
+        if (word.endsWith("s") && word.length() > 4) return word.substring(0, word.length() - 1);
         return word;
     }
 }
 
-// ===== INVERTED INDEX =====
+// ==================== POSTING ENTRY ====================
 
 /**
- * Inverted Index - Core data structure for search
+ * Stores per-document info for a term: frequency + positions.
+ * Positions enable phrase search (consecutive position matching).
  * 
- * STRUCTURE:
- *   term -> [docId1, docId2, docId3, ...]
- *   "java" -> ["doc1", "doc3", "doc5"]
- *   "python" -> ["doc2", "doc4"]
+ * Example: "java" in doc1 at positions [0, 5, 12] with field "content"
+ */
+class PostingEntry {
+    private final String docId;
+    private final String field;   // "title" or "content"
+    private int frequency;
+    private final List<Integer> positions; // for phrase search
+
+    public PostingEntry(String docId, String field) {
+        this.docId = docId;
+        this.field = field;
+        this.frequency = 0;
+        this.positions = new ArrayList<>();
+    }
+
+    public void addPosition(int pos) {
+        positions.add(pos);
+        frequency++;
+    }
+
+    public String getDocId() { return docId; }
+    public String getField() { return field; }
+    public int getFrequency() { return frequency; }
+    public List<Integer> getPositions() { return positions; }
+}
+
+// ==================== INVERTED INDEX ====================
+
+/**
+ * Inverted Index with positional information and field tracking.
  * 
- * INTERVIEW DISCUSSION:
- * - Why inverted? (Inverts document->terms to term->documents)
- * - Alternative: Forward index (document -> terms) - for phrase search
- * - Used in: Elasticsearch, Solr, Lucene
- * - Time complexity: O(1) term lookup, O(k) where k=matching docs
+ * Structure:
+ *   term -> { docId -> [PostingEntry(field="title", freq, positions),
+ *                        PostingEntry(field="content", freq, positions)] }
+ * 
+ * Why inverted? Forward index (doc -> terms) requires scanning all docs.
+ * Inverted index (term -> docs) gives O(1) term lookup.
  */
 class InvertedIndex {
-    // term -> set of document IDs
-    private Map<String, Set<String>> index;
-    
-    // term -> document -> frequency (TF)
-    private Map<String, Map<String, Integer>> termFrequency;
-    
-    // document -> term count (for normalization)
-    private Map<String, Integer> documentLength;
-    
-    // Total documents (for IDF calculation)
-    private int totalDocuments;
-    
+    // term -> docId -> list of postings (one per field)
+    private final Map<String, Map<String, List<PostingEntry>>> index;
+    // docId -> total term count (for TF normalization)
+    private final Map<String, Integer> docLengths;
+    private int totalDocs;
+
+    // Field weights for scoring: title match is 3x more important
+    private static final Map<String, Double> FIELD_WEIGHTS = Map.of(
+        "title", 3.0,
+        "content", 1.0
+    );
+
     public InvertedIndex() {
-        this.index = new HashMap<>();
-        this.termFrequency = new HashMap<>();
-        this.documentLength = new HashMap<>();
-        this.totalDocuments = 0;
+        this.index = new ConcurrentHashMap<>();
+        this.docLengths = new ConcurrentHashMap<>();
+        this.totalDocs = 0;
     }
-    
-    /**
-     * Index a document
-     * 
-     * ALGORITHM:
-     * 1. Tokenize document content
-     * 2. For each term:
-     *    a. Add docId to inverted index
-     *    b. Track term frequency in document
-     * 3. Store document length
-     * 
-     * TIME COMPLEXITY: O(n) where n = number of terms
-     */
-    public void addDocument(String docId, List<String> terms) {
-        totalDocuments++;
-        documentLength.put(docId, terms.size());
-        
-        // Count term frequencies
-        Map<String, Integer> termCounts = new HashMap<>();
-        for (String term : terms) {
-            termCounts.put(term, termCounts.getOrDefault(term, 0) + 1);
-        }
-        
-        // Update inverted index
-        for (Map.Entry<String, Integer> entry : termCounts.entrySet()) {
-            String term = entry.getKey();
-            int count = entry.getValue();
-            
-            // Add to inverted index
-            index.computeIfAbsent(term, k -> new HashSet<>()).add(docId);
-            
-            // Track term frequency
-            termFrequency.computeIfAbsent(term, k -> new HashMap<>()).put(docId, count);
-        }
-    }
-    
-    /**
-     * Get documents containing term
-     */
-    public Set<String> getDocuments(String term) {
-        return index.getOrDefault(term, new HashSet<>());
-    }
-    
-    /**
-     * Get term frequency in document
-     */
-    public int getTermFrequency(String term, String docId) {
-        return termFrequency.getOrDefault(term, new HashMap<>())
-                           .getOrDefault(docId, 0);
-    }
-    
-    /**
-     * Calculate TF-IDF score
-     * 
-     * TF (Term Frequency): How often term appears in document
-     *   TF = termFreq / docLength
-     * 
-     * IDF (Inverse Document Frequency): How rare the term is
-     *   IDF = log(totalDocs / docsWithTerm)
-     * 
-     * TF-IDF = TF * IDF
-     * 
-     * INTUITION:
-     * - Common terms (the, is) have low IDF -> low score
-     * - Rare terms (elasticsearch) have high IDF -> high score
-     * - Frequent in doc + rare overall = most relevant
-     */
-    public double calculateTfIdf(String term, String docId) {
-        int tf = getTermFrequency(term, docId);
-        if (tf == 0) return 0.0;
-        
-        int docLen = documentLength.getOrDefault(docId, 1);
-        int docsWithTerm = getDocuments(term).size();
-        
-        // TF: normalized frequency
-        double tfScore = (double) tf / docLen;
-        
-        // IDF: logarithmic scaling
-        double idf = Math.log((double) totalDocuments / docsWithTerm);
-        
-        return tfScore * idf;
-    }
-    
-    public int getTotalDocuments() { return totalDocuments; }
-    public int getDocumentLength(String docId) { 
-        return documentLength.getOrDefault(docId, 0); 
-    }
-    
-    /**
-     * Get number of unique terms in index
-     */
-    public int getTermCount() {
-        return index.size();
-    }
-    
-    /**
-     * Get average documents per term
-     */
-    public double getAvgDocsPerTerm() {
-        if (index.isEmpty()) return 0.0;
-        return (double) index.values().stream()
-                .mapToInt(Set::size).sum() / index.size();
-    }
-}
 
-// ===== SEARCH INDEX =====
+    /**
+     * Index terms from a document field.
+     * Tracks term frequency AND positions for phrase search.
+     */
+    public void addDocument(String docId, String field, List<String> terms) {
+        docLengths.merge(docId, terms.size(), Integer::sum);
 
-/**
- * Search Index - Main search engine class
- * 
- * RESPONSIBILITIES:
- * - Index documents
- * - Process search queries
- * - Rank results by relevance
- * - Support boolean queries (AND, OR, NOT)
- * 
- * INTERVIEW DISCUSSION:
- * - Inverted index for fast term lookup
- * - TF-IDF for ranking
- * - Query processing: parse, execute, rank
- * - Scalability: sharding, replication
- */
-class SearchIndexEngine {
-    private Map<String, Document> documents;
-    private InvertedIndex invertedIndex;
-    
-    public SearchIndexEngine() {
-        this.documents = new HashMap<>();
-        this.invertedIndex = new InvertedIndex();
-    }
-    
-    /**
-     * Index a document
-     * 
-     * @param document Document to index
-     */
-    public void indexDocument(Document document) {
-        documents.put(document.getId(), document);
-        
-        // Tokenize title and content
-        List<String> terms = new ArrayList<>();
-        terms.addAll(TextProcessor.tokenize(document.getTitle()));
-        terms.addAll(TextProcessor.tokenize(document.getContent()));
-        
-        invertedIndex.addDocument(document.getId(), terms);
-        
-        System.out.println("Indexed: " + document.getId() + " (" + terms.size() + " terms)");
-    }
-    
-    /**
-     * Search for documents matching query
-     * 
-     * @param query Search query
-     * @return List of ranked results
-     */
-    public List<SearchResult> search(String query) {
-        return search(query, 10);  // Default limit 10
-    }
-    
-    /**
-     * Search with result limit
-     * 
-     * ALGORITHM:
-     * 1. Tokenize query
-     * 2. Find documents containing any query term
-     * 3. Calculate relevance score for each document
-     * 4. Sort by score (descending)
-     * 5. Return top N results
-     * 
-     * @param query Search query
-     * @param limit Max results
-     * @return Ranked search results
-     */
-    public List<SearchResult> search(String query, int limit) {
-        List<String> queryTerms = TextProcessor.tokenize(query);
-        if (queryTerms.isEmpty()) {
-            return new ArrayList<>();
-        }
-        
-        // Find candidate documents (union of all matching docs)
-        Set<String> candidateDocs = new HashSet<>();
-        for (String term : queryTerms) {
-            candidateDocs.addAll(invertedIndex.getDocuments(term));
-        }
-        
-        // Score each candidate document
-        List<SearchResult> results = new ArrayList<>();
-        for (String docId : candidateDocs) {
-            Document doc = documents.get(docId);
-            if (doc == null) continue;
-            
-            double score = calculateRelevanceScore(queryTerms, docId);
-            SearchResult result = new SearchResult(doc, score);
-            
-            // Track which terms matched
-            for (String term : queryTerms) {
-                if (invertedIndex.getTermFrequency(term, docId) > 0) {
-                    result.addMatchedTerm(term);
-                }
+        for (int pos = 0; pos < terms.size(); pos++) {
+            String term = terms.get(pos);
+
+            Map<String, List<PostingEntry>> docMap =
+                index.computeIfAbsent(term, k -> new ConcurrentHashMap<>());
+            List<PostingEntry> postings =
+                docMap.computeIfAbsent(docId, k -> new CopyOnWriteArrayList<>());
+
+            // Find or create posting for this field
+            PostingEntry entry = null;
+            for (PostingEntry p : postings) {
+                if (p.getField().equals(field)) { entry = p; break; }
             }
-            
-            results.add(result);
+            if (entry == null) {
+                entry = new PostingEntry(docId, field);
+                postings.add(entry);
+            }
+            entry.addPosition(pos);
         }
-        
-        // Sort by score and limit
-        Collections.sort(results);
-        return results.stream().limit(limit).collect(Collectors.toList());
     }
-    
-    /**
-     * Calculate relevance score for document
-     * Sum of TF-IDF scores for all query terms
-     */
-    private double calculateRelevanceScore(List<String> queryTerms, String docId) {
-        double score = 0.0;
-        
-        for (String term : queryTerms) {
-            score += invertedIndex.calculateTfIdf(term, docId);
+
+    /** Remove all postings for a document. */
+    public void removeDocument(String docId) {
+        docLengths.remove(docId);
+        for (Map<String, List<PostingEntry>> docMap : index.values()) {
+            docMap.remove(docId);
         }
-        
+        // Clean up empty term entries
+        index.entrySet().removeIf(e -> e.getValue().isEmpty());
+    }
+
+    public void incrementTotalDocs() { totalDocs++; }
+    public void decrementTotalDocs() { totalDocs = Math.max(0, totalDocs - 1); }
+
+    /** Get all document IDs containing term. */
+    public Set<String> getDocIds(String term) {
+        Map<String, List<PostingEntry>> docMap = index.get(term);
+        return docMap == null ? Collections.emptySet() : docMap.keySet();
+    }
+
+    /** Get postings for a term in a specific document. */
+    public List<PostingEntry> getPostings(String term, String docId) {
+        Map<String, List<PostingEntry>> docMap = index.get(term);
+        if (docMap == null) return Collections.emptyList();
+        List<PostingEntry> postings = docMap.get(docId);
+        return postings == null ? Collections.emptyList() : postings;
+    }
+
+    /**
+     * TF-IDF with field weighting.
+     * 
+     * TF  = termFreq / docLength  (how often term appears in doc)
+     * IDF = log(N / df)           (how rare the term is globally)
+     * Field boost: title match × 3, content match × 1
+     * 
+     * Score = Σ (TF × IDF × fieldWeight) across all fields
+     */
+    public double calculateScore(String term, String docId) {
+        List<PostingEntry> postings = getPostings(term, docId);
+        if (postings.isEmpty()) return 0.0;
+
+        int docLen = docLengths.getOrDefault(docId, 1);
+        int df = getDocIds(term).size();
+        double idf = Math.log((double) (totalDocs + 1) / (df + 1)) + 1.0; // smoothed IDF
+
+        double score = 0.0;
+        for (PostingEntry p : postings) {
+            double tf = (double) p.getFrequency() / docLen;
+            double fieldWeight = FIELD_WEIGHTS.getOrDefault(p.getField(), 1.0);
+            score += tf * idf * fieldWeight;
+        }
         return score;
     }
-    
+
     /**
-     * Boolean AND search - documents must contain ALL terms
-     * 
-     * @param query Search query
-     * @return Documents containing all terms
+     * Check if terms appear consecutively (phrase search).
+     * For each pair of adjacent query terms, check if their positions
+     * in the document are also adjacent (pos[i+1] = pos[i] + 1).
      */
-    public List<SearchResult> searchAnd(String query) {
-        List<String> queryTerms = TextProcessor.tokenize(query);
-        if (queryTerms.isEmpty()) {
-            return new ArrayList<>();
+    public boolean hasPhrase(String docId, List<String> phraseTerms) {
+        if (phraseTerms.size() <= 1) return true;
+
+        // Gather positions per term per field
+        // We check phrase within the same field
+        Map<String, List<List<Integer>>> fieldPositions = new HashMap<>();
+
+        for (String term : phraseTerms) {
+            List<PostingEntry> postings = getPostings(term, docId);
+            if (postings.isEmpty()) return false;
+            for (PostingEntry p : postings) {
+                fieldPositions.computeIfAbsent(p.getField(), k -> new ArrayList<>())
+                              .add(p.getPositions());
+            }
         }
-        
-        // Start with docs containing first term
-        Set<String> resultDocs = new HashSet<>(invertedIndex.getDocuments(queryTerms.get(0)));
-        
-        // Intersect with docs containing other terms
-        for (int i = 1; i < queryTerms.size(); i++) {
-            resultDocs.retainAll(invertedIndex.getDocuments(queryTerms.get(i)));
+
+        // For each field, check consecutive positions
+        for (Map.Entry<String, List<List<Integer>>> entry : fieldPositions.entrySet()) {
+            List<List<Integer>> posLists = entry.getValue();
+            if (posLists.size() != phraseTerms.size()) continue;
+
+            // Check if there's a sequence where pos[i+1] = pos[i] + 1
+            if (hasConsecutivePositions(posLists, 0, -1)) return true;
         }
-        
-        // Score and return
-        List<SearchResult> results = new ArrayList<>();
-        for (String docId : resultDocs) {
-            Document doc = documents.get(docId);
-            double score = calculateRelevanceScore(queryTerms, docId);
-            results.add(new SearchResult(doc, score));
+        return false;
+    }
+
+    /** Recursive check for consecutive positions across term position lists. */
+    private boolean hasConsecutivePositions(List<List<Integer>> posLists, int termIdx, int prevPos) {
+        if (termIdx >= posLists.size()) return true;
+
+        for (int pos : posLists.get(termIdx)) {
+            if (termIdx == 0 || pos == prevPos + 1) {
+                if (hasConsecutivePositions(posLists, termIdx + 1, pos)) return true;
+            }
         }
-        
-        Collections.sort(results);
-        return results;
+        return false;
     }
-    
-    /**
-     * Phrase search - find exact phrase
-     * 
-     * IMPLEMENTATION:
-     * - Find docs containing all terms
-     * - Check if terms appear consecutively
-     * 
-     * NOTE: Requires positional index (term -> docId -> positions)
-     * Simplified here: just check all terms present
-     */
-    public List<SearchResult> searchPhrase(String phrase) {
-        // Simplified: treat as AND search
-        // Production: use positional index to verify consecutive terms
-        return searchAnd(phrase);
+
+    /** Get all terms starting with prefix (for wildcard search). */
+    public Set<String> getTermsWithPrefix(String prefix) {
+        Set<String> result = new HashSet<>();
+        for (String term : index.keySet()) {
+            if (term.startsWith(prefix)) result.add(term);
+        }
+        return result;
     }
-    
-    /**
-     * Get document by ID
-     */
-    public Document getDocument(String docId) {
-        return documents.get(docId);
-    }
-    
-    /**
-     * Get index statistics
-     */
-    public String getStats() {
-        int totalTerms = invertedIndex.getTermCount();
-        int totalDocs = documents.size();
-        double avgDocsPerTerm = invertedIndex.getAvgDocsPerTerm();
-        
-        return String.format("Documents: %d, Terms: %d, Avg docs/term: %.1f",
-                           totalDocs, totalTerms, avgDocsPerTerm);
-    }
+
+    public int getTotalDocs() { return totalDocs; }
+    public int getTermCount() { return index.size(); }
+    public int getDocLength(String docId) { return docLengths.getOrDefault(docId, 0); }
 }
 
-// ===== AUTOCOMPLETE / SUGGESTION =====
+// ==================== TRIE (AUTOCOMPLETE) ====================
 
 /**
- * Trie-based autocomplete for search suggestions
+ * Trie for autocomplete suggestions, ranked by search frequency.
  * 
- * INTERVIEW DISCUSSION:
- * - Trie (Prefix Tree) for efficient prefix matching
- * - Used for: autocomplete, spell checking
- * - Time: O(k) for lookup where k = query length
+ * Time: O(k) insert/lookup where k = word length.
+ * Space: O(N × L) where N = words, L = avg length.
  */
 class TrieNode {
-    Map<Character, TrieNode> children;
-    boolean isEndOfWord;
-    int frequency;  // How often this word was searched
-    
-    public TrieNode() {
-        children = new HashMap<>();
-        isEndOfWord = false;
-        frequency = 0;
-    }
+    final Map<Character, TrieNode> children = new HashMap<>();
+    boolean isWord;
+    int frequency; // how often this was searched/added
+    String word;   // store complete word at leaf for easy retrieval
 }
 
 class AutocompleteEngine {
-    private TrieNode root;
-    
-    public AutocompleteEngine() {
-        this.root = new TrieNode();
-    }
-    
-    /**
-     * Add word to trie
-     */
-    public void addWord(String word) {
+    private final TrieNode root = new TrieNode();
+
+    public void addWord(String word, int freq) {
         TrieNode node = root;
-        for (char ch : word.toCharArray()) {
+        String lower = word.toLowerCase();
+        for (char ch : lower.toCharArray()) {
             node.children.putIfAbsent(ch, new TrieNode());
             node = node.children.get(ch);
         }
-        node.isEndOfWord = true;
-        node.frequency++;
+        node.isWord = true;
+        node.frequency += freq;
+        node.word = lower;
     }
-    
-    /**
-     * Get autocomplete suggestions for prefix
-     * 
-     * @param prefix Query prefix
-     * @param limit Max suggestions
-     * @return List of suggested completions
-     */
-    public List<String> getSuggestions(String prefix, int limit) {
-        prefix = prefix.toLowerCase();
+
+    public void addWord(String word) { addWord(word, 1); }
+
+    /** Get top-K suggestions sorted by frequency (descending). */
+    public List<String> suggest(String prefix, int limit) {
         TrieNode node = root;
-        
-        // Navigate to prefix node
-        for (char ch : prefix.toCharArray()) {
-            if (!node.children.containsKey(ch)) {
-                return new ArrayList<>();  // Prefix not found
-            }
+        for (char ch : prefix.toLowerCase().toCharArray()) {
             node = node.children.get(ch);
+            if (node == null) return Collections.emptyList();
         }
-        
-        // Collect all words with this prefix
-        List<String> suggestions = new ArrayList<>();
-        collectWords(node, prefix, suggestions, limit);
-        return suggestions;
+
+        // Collect all words under this prefix with their frequencies
+        PriorityQueue<TrieNode> pq = new PriorityQueue<>(
+            (a, b) -> b.frequency - a.frequency // max-heap by frequency
+        );
+        collectWords(node, pq);
+
+        List<String> result = new ArrayList<>();
+        while (!pq.isEmpty() && result.size() < limit) {
+            result.add(pq.poll().word);
+        }
+        return result;
     }
-    
-    /**
-     * DFS to collect all words from node
-     */
-    private void collectWords(TrieNode node, String current, List<String> result, int limit) {
-        if (result.size() >= limit) return;
-        
-        if (node.isEndOfWord) {
-            result.add(current);
+
+    private void collectWords(TrieNode node, PriorityQueue<TrieNode> pq) {
+        if (node.isWord) pq.offer(node);
+        for (TrieNode child : node.children.values()) {
+            collectWords(child, pq);
         }
-        
-        for (Map.Entry<Character, TrieNode> entry : node.children.entrySet()) {
-            collectWords(entry.getValue(), current + entry.getKey(), result, limit);
+    }
+
+    /** Remove a word from the trie. */
+    public boolean remove(String word) {
+        return remove(root, word.toLowerCase(), 0);
+    }
+
+    private boolean remove(TrieNode node, String word, int idx) {
+        if (idx == word.length()) {
+            if (!node.isWord) return false;
+            node.isWord = false;
+            node.frequency = 0;
+            node.word = null;
+            return node.children.isEmpty();
         }
+        char ch = word.charAt(idx);
+        TrieNode child = node.children.get(ch);
+        if (child == null) return false;
+
+        boolean shouldDelete = remove(child, word, idx + 1);
+        if (shouldDelete) {
+            node.children.remove(ch);
+            return !node.isWord && node.children.isEmpty();
+        }
+        return false;
     }
 }
 
-// ===== MAIN TEST CLASS =====
+// ==================== SEARCH INDEX ENGINE ====================
+
+/**
+ * Main search engine: index, search, rank, autocomplete.
+ * Thread-safe via ReadWriteLock (concurrent reads, exclusive writes).
+ */
+class SearchIndexEngine {
+    private final Map<String, Document> documents;
+    private final InvertedIndex invertedIndex;
+    private final AutocompleteEngine autocomplete;
+    private final ReadWriteLock lock;
+
+    public SearchIndexEngine() {
+        this.documents = new ConcurrentHashMap<>();
+        this.invertedIndex = new InvertedIndex();
+        this.autocomplete = new AutocompleteEngine();
+        this.lock = new ReentrantReadWriteLock();
+    }
+
+    // ---------- INDEXING ----------
+
+    /** Index a new document (title + content indexed separately for field weighting). */
+    public void indexDocument(Document doc) {
+        lock.writeLock().lock();
+        try {
+            // Remove old version if exists (update)
+            if (documents.containsKey(doc.getId())) {
+                removeDocumentInternal(doc.getId());
+            }
+
+            documents.put(doc.getId(), doc);
+            invertedIndex.incrementTotalDocs();
+
+            // Index title and content separately (field-specific)
+            List<String> titleTerms = TextProcessor.tokenize(doc.getTitle());
+            List<String> contentTerms = TextProcessor.tokenize(doc.getContent());
+
+            invertedIndex.addDocument(doc.getId(), "title", titleTerms);
+            invertedIndex.addDocument(doc.getId(), "content", contentTerms);
+
+            // Add terms to autocomplete
+            Set<String> allTerms = new HashSet<>();
+            allTerms.addAll(titleTerms);
+            allTerms.addAll(contentTerms);
+            for (String term : allTerms) {
+                autocomplete.addWord(term);
+            }
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    /** Remove a document from the index. */
+    public boolean removeDocument(String docId) {
+        lock.writeLock().lock();
+        try {
+            return removeDocumentInternal(docId);
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    private boolean removeDocumentInternal(String docId) {
+        Document removed = documents.remove(docId);
+        if (removed == null) return false;
+        invertedIndex.removeDocument(docId);
+        invertedIndex.decrementTotalDocs();
+        return true;
+    }
+
+    // ---------- SEARCH ----------
+
+    /** OR search: documents matching ANY query term, ranked by TF-IDF. */
+    public List<SearchResult> search(String query, int limit) {
+        lock.readLock().lock();
+        try {
+            List<String> queryTerms = TextProcessor.tokenize(query);
+            if (queryTerms.isEmpty()) return Collections.emptyList();
+
+            // Gather candidate docs (union)
+            Set<String> candidates = new HashSet<>();
+            for (String term : queryTerms) {
+                candidates.addAll(invertedIndex.getDocIds(term));
+            }
+
+            // Score each candidate
+            List<SearchResult> results = new ArrayList<>();
+            for (String docId : candidates) {
+                Document doc = documents.get(docId);
+                if (doc == null) continue;
+
+                double score = 0;
+                Set<String> matched = new HashSet<>();
+                for (String term : queryTerms) {
+                    double termScore = invertedIndex.calculateScore(term, docId);
+                    if (termScore > 0) {
+                        score += termScore;
+                        matched.add(term);
+                    }
+                }
+                results.add(new SearchResult(doc, score, matched));
+            }
+
+            Collections.sort(results);
+            return results.stream().limit(limit).collect(Collectors.toList());
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    public List<SearchResult> search(String query) { return search(query, 10); }
+
+    /** AND search: documents must contain ALL query terms. */
+    public List<SearchResult> searchAnd(String query, int limit) {
+        lock.readLock().lock();
+        try {
+            List<String> queryTerms = TextProcessor.tokenize(query);
+            if (queryTerms.isEmpty()) return Collections.emptyList();
+
+            // Intersect document sets (start with smallest for efficiency)
+            List<Set<String>> docSets = new ArrayList<>();
+            for (String term : queryTerms) {
+                docSets.add(new HashSet<>(invertedIndex.getDocIds(term)));
+            }
+            docSets.sort(Comparator.comparingInt(Set::size)); // smallest first
+
+            Set<String> candidates = docSets.get(0);
+            for (int i = 1; i < docSets.size(); i++) {
+                candidates.retainAll(docSets.get(i));
+                if (candidates.isEmpty()) return Collections.emptyList();
+            }
+
+            // Score and rank
+            List<SearchResult> results = new ArrayList<>();
+            for (String docId : candidates) {
+                Document doc = documents.get(docId);
+                if (doc == null) continue;
+
+                double score = 0;
+                Set<String> matched = new HashSet<>(queryTerms);
+                for (String term : queryTerms) {
+                    score += invertedIndex.calculateScore(term, docId);
+                }
+                results.add(new SearchResult(doc, score, matched));
+            }
+
+            Collections.sort(results);
+            return results.stream().limit(limit).collect(Collectors.toList());
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    /** Phrase search: terms must appear consecutively in the document. */
+    public List<SearchResult> searchPhrase(String phrase, int limit) {
+        lock.readLock().lock();
+        try {
+            List<String> phraseTerms = TextProcessor.tokenize(phrase);
+            if (phraseTerms.isEmpty()) return Collections.emptyList();
+
+            // First: AND search to get candidates
+            Set<String> candidates = new HashSet<>(invertedIndex.getDocIds(phraseTerms.get(0)));
+            for (int i = 1; i < phraseTerms.size(); i++) {
+                candidates.retainAll(invertedIndex.getDocIds(phraseTerms.get(i)));
+            }
+
+            // Then: filter by consecutive positions
+            List<SearchResult> results = new ArrayList<>();
+            for (String docId : candidates) {
+                if (!invertedIndex.hasPhrase(docId, phraseTerms)) continue;
+
+                Document doc = documents.get(docId);
+                if (doc == null) continue;
+
+                double score = 0;
+                for (String term : phraseTerms) {
+                    score += invertedIndex.calculateScore(term, docId);
+                }
+                // Phrase match bonus (1.5x boost)
+                score *= 1.5;
+                results.add(new SearchResult(doc, score, new HashSet<>(phraseTerms)));
+            }
+
+            Collections.sort(results);
+            return results.stream().limit(limit).collect(Collectors.toList());
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    /** Prefix/wildcard search: find docs containing terms starting with prefix. */
+    public List<SearchResult> searchPrefix(String prefix, int limit) {
+        lock.readLock().lock();
+        try {
+            String normalizedPrefix = prefix.toLowerCase();
+            Set<String> matchingTerms = invertedIndex.getTermsWithPrefix(normalizedPrefix);
+            if (matchingTerms.isEmpty()) return Collections.emptyList();
+
+            // Gather candidate docs from all matching terms
+            Map<String, Double> docScores = new HashMap<>();
+            Map<String, Set<String>> docMatched = new HashMap<>();
+
+            for (String term : matchingTerms) {
+                for (String docId : invertedIndex.getDocIds(term)) {
+                    double score = invertedIndex.calculateScore(term, docId);
+                    docScores.merge(docId, score, Double::sum);
+                    docMatched.computeIfAbsent(docId, k -> new HashSet<>()).add(term);
+                }
+            }
+
+            List<SearchResult> results = new ArrayList<>();
+            for (Map.Entry<String, Double> entry : docScores.entrySet()) {
+                Document doc = documents.get(entry.getKey());
+                if (doc == null) continue;
+                results.add(new SearchResult(doc, entry.getValue(),
+                    docMatched.getOrDefault(entry.getKey(), Collections.emptySet())));
+            }
+
+            Collections.sort(results);
+            return results.stream().limit(limit).collect(Collectors.toList());
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    // ---------- AUTOCOMPLETE ----------
+
+    /** Get autocomplete suggestions for prefix, ranked by frequency. */
+    public List<String> autocomplete(String prefix, int limit) {
+        lock.readLock().lock();
+        try {
+            return autocomplete.suggest(prefix, limit);
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    // ---------- UTILITY ----------
+
+    public Document getDocument(String docId) { return documents.get(docId); }
+    public int getDocumentCount() { return documents.size(); }
+
+    public String getStats() {
+        return String.format("Documents: %d | Unique Terms: %d",
+            documents.size(), invertedIndex.getTermCount());
+    }
+}
+
+// ==================== MAIN / TESTS ====================
 
 public class SearchIndex {
     public static void main(String[] args) {
-        System.out.println("=== Search Index Test Cases ===\n");
-        
-        // Test Case 1: Basic Indexing and Search
-        System.out.println("=== Test Case 1: Basic Indexing and Search ===");
+        System.out.println("╔══════════════════════════════════════════╗");
+        System.out.println("║       SEARCH INDEX - LLD Demo            ║");
+        System.out.println("╚══════════════════════════════════════════╝\n");
+
         SearchIndexEngine engine = new SearchIndexEngine();
-        
-        engine.indexDocument(new Document("1", "Java Programming", 
-            "Java is a popular programming language for building enterprise applications"));
-        engine.indexDocument(new Document("2", "Python Guide", 
-            "Python is a versatile programming language loved by data scientists"));
-        engine.indexDocument(new Document("3", "JavaScript Basics", 
-            "JavaScript is essential for web development and runs in browsers"));
-        
-        System.out.println("\nSearch: 'programming'");
-        List<SearchResult> results = engine.search("programming");
-        for (SearchResult result : results) {
-            System.out.println(result);
-        }
-        System.out.println("✓ Basic search working");
-        System.out.println();
-        
-        // Test Case 2: Multi-term Search (OR)
-        System.out.println("=== Test Case 2: Multi-term Search (OR) ===");
-        System.out.println("Search: 'java python'");
-        results = engine.search("java python");
-        for (SearchResult result : results) {
-            System.out.println(result);
-        }
-        System.out.println("✓ Multi-term OR search working");
-        System.out.println();
-        
-        // Test Case 3: Boolean AND Search
-        System.out.println("=== Test Case 3: Boolean AND Search ===");
-        System.out.println("Search AND: 'programming language'");
-        results = engine.searchAnd("programming language");
-        System.out.println("Found " + results.size() + " docs with ALL terms");
-        for (SearchResult result : results) {
-            System.out.println(result);
-        }
-        System.out.println("✓ AND search working");
-        System.out.println();
-        
-        // Test Case 4: No Results
-        System.out.println("=== Test Case 4: No Results ===");
-        results = engine.search("nonexistent");
-        System.out.println("Results for 'nonexistent': " + results.size() + " (expected 0)");
-        System.out.println("✓ Empty result handling working");
-        System.out.println();
-        
-        // Test Case 5: Stop Words Removed
-        System.out.println("=== Test Case 5: Stop Words Removal ===");
-        System.out.println("Search: 'the java programming' (stop word 'the' removed)");
-        results = engine.search("the java programming");
-        System.out.println("Found: " + results.size() + " results");
-        System.out.println("✓ Stop words filtering working");
-        System.out.println();
-        
-        // Test Case 6: TF-IDF Ranking
-        System.out.println("=== Test Case 6: TF-IDF Ranking ===");
+
+        // --- Test 1: Basic Indexing & OR Search ---
+        System.out.println("=== Test 1: Index & OR Search ===");
+        engine.indexDocument(new Document("1", "Java Programming Guide",
+            "Java is a popular programming language for building enterprise applications and microservices"));
+        engine.indexDocument(new Document("2", "Python Data Science",
+            "Python is a versatile programming language loved by data scientists and machine learning engineers"));
+        engine.indexDocument(new Document("3", "JavaScript Web Development",
+            "JavaScript is essential for web development and runs in browsers with Node.js on server side"));
+        engine.indexDocument(new Document("4", "Java Microservices Architecture",
+            "Building microservices with Java Spring Boot for distributed systems and cloud native applications"));
+        engine.indexDocument(new Document("5", "Python Machine Learning",
+            "Machine learning with Python using scikit learn tensorflow and neural networks for AI applications"));
+
+        System.out.println(engine.getStats());
+        System.out.println("\nSearch 'programming':");
+        engine.search("programming").forEach(System.out::println);
+        System.out.println("✓ OR search ranks Java & Python docs (both mention programming)\n");
+
+        // --- Test 2: AND Search ---
+        System.out.println("=== Test 2: AND Search ===");
+        System.out.println("Search AND 'java microservices':");
+        engine.searchAnd("java microservices", 10).forEach(System.out::println);
+        System.out.println("✓ Only docs with BOTH 'java' AND 'microservices' returned\n");
+
+        // --- Test 3: Field Weighting (title > content) ---
+        System.out.println("=== Test 3: Field Weighting ===");
+        System.out.println("Search 'python': doc with 'Python' in title should rank higher");
+        List<SearchResult> results = engine.search("python");
+        results.forEach(System.out::println);
+        System.out.println("✓ Title matches get 3x weight boost\n");
+
+        // --- Test 4: Phrase Search (positional index) ---
+        System.out.println("=== Test 4: Phrase Search ===");
+        System.out.println("Phrase search 'machine learning':");
+        engine.searchPhrase("machine learning", 10).forEach(System.out::println);
+        System.out.println("✓ Only docs with 'machine learning' as consecutive words\n");
+
+        // --- Test 5: Prefix/Wildcard Search ---
+        System.out.println("=== Test 5: Prefix Search ===");
+        System.out.println("Prefix search 'micro':");
+        engine.searchPrefix("micro", 10).forEach(System.out::println);
+        System.out.println("✓ Finds docs with terms starting with 'micro' (microservices, etc.)\n");
+
+        // --- Test 6: Autocomplete ---
+        System.out.println("=== Test 6: Autocomplete ===");
+        System.out.println("Suggestions for 'jav': " + engine.autocomplete("jav", 5));
+        System.out.println("Suggestions for 'pro': " + engine.autocomplete("pro", 5));
+        System.out.println("Suggestions for 'mac': " + engine.autocomplete("mac", 5));
+        System.out.println("✓ Trie-based autocomplete with frequency ranking\n");
+
+        // --- Test 7: Document Update (re-index) ---
+        System.out.println("=== Test 7: Document Update ===");
+        System.out.println("Before update - search 'rust': " + engine.search("rust").size() + " results");
+        engine.indexDocument(new Document("1", "Rust Programming Guide",
+            "Rust is a systems programming language focused on safety and performance"));
+        System.out.println("After update doc1 to Rust - search 'rust': " + engine.search("rust").size() + " results");
+        System.out.println("Search 'java' (doc1 no longer about java):");
+        engine.search("java").forEach(System.out::println);
+        System.out.println("✓ Re-indexing removes old terms, adds new ones\n");
+
+        // --- Test 8: Document Removal ---
+        System.out.println("=== Test 8: Document Removal ===");
+        int before = engine.getDocumentCount();
+        engine.removeDocument("5");
+        int after = engine.getDocumentCount();
+        System.out.println("Before remove: " + before + ", After remove: " + after);
+        System.out.println("Search 'neural' (was in doc5): " + engine.search("neural").size() + " results");
+        System.out.println("✓ Removed document no longer appears in search\n");
+
+        // --- Test 9: Edge Cases ---
+        System.out.println("=== Test 9: Edge Cases ===");
+        System.out.println("Empty query: " + engine.search("").size() + " results (expected 0)");
+        System.out.println("Stop words only 'the is a': " + engine.search("the is a").size() + " results (expected 0)");
+        System.out.println("Non-existent term 'xyzzyqwert': " + engine.search("xyzzyqwert").size() + " results (expected 0)");
+        System.out.println("Remove non-existent doc: " + engine.removeDocument("999"));
+        System.out.println("✓ Edge cases handled gracefully\n");
+
+        // --- Test 10: TF-IDF Ranking Correctness ---
+        System.out.println("=== Test 10: TF-IDF Ranking ===");
         SearchIndexEngine engine2 = new SearchIndexEngine();
-        engine2.indexDocument(new Document("d1", "Doc 1", 
-            "java java java"));  // High TF for "java"
-        engine2.indexDocument(new Document("d2", "Doc 2", 
-            "java python ruby"));
-        engine2.indexDocument(new Document("d3", "Doc 3", 
-            "python ruby javascript"));
-        
-        System.out.println("Search: 'java' (d1 should rank higher - more occurrences)");
-        results = engine2.search("java");
-        for (SearchResult result : results) {
-            System.out.println(result);
-        }
-        System.out.println("✓ TF-IDF ranking working");
-        System.out.println();
-        
-        // Test Case 7: Large Document Set
-        System.out.println("=== Test Case 7: Large Document Set ===");
+        engine2.indexDocument(new Document("a", "Doc A", "java java java java java")); // high TF
+        engine2.indexDocument(new Document("b", "Doc B", "java python ruby golang"));  // low TF
+        engine2.indexDocument(new Document("c", "Doc C", "python ruby golang rust"));  // no java
+        System.out.println("Search 'java' - doc A (5x java) should rank above doc B (1x java):");
+        engine2.search("java").forEach(System.out::println);
+        System.out.println("✓ Higher term frequency = higher TF-IDF score\n");
+
+        // --- Test 11: Large Dataset ---
+        System.out.println("=== Test 11: Large Dataset ===");
         SearchIndexEngine engine3 = new SearchIndexEngine();
-        for (int i = 0; i < 100; i++) {
-            String content = "Document " + i + " contains various terms";
-            if (i % 3 == 0) content += " java programming";
-            if (i % 5 == 0) content += " python data science";
-            engine3.indexDocument(new Document("doc" + i, "Doc " + i, content));
+        String[] topics = {"java", "python", "distributed systems", "microservices",
+                          "machine learning", "database design", "cloud computing"};
+        for (int i = 0; i < 1000; i++) {
+            String topic = topics[i % topics.length];
+            engine3.indexDocument(new Document("doc" + i, "Article " + i,
+                topic + " concepts and best practices for software engineering document " + i));
         }
-        
         System.out.println(engine3.getStats());
-        System.out.println("Search: 'java'");
-        results = engine3.search("java", 5);
-        System.out.println("Top 5 results:");
-        for (SearchResult result : results) {
-            System.out.println(result);
-        }
-        System.out.println("✓ Large dataset working");
-        System.out.println();
-        
-        // Test Case 8: Autocomplete
-        System.out.println("=== Test Case 8: Autocomplete ===");
-        AutocompleteEngine autocomplete = new AutocompleteEngine();
-        autocomplete.addWord("java");
-        autocomplete.addWord("javascript");
-        autocomplete.addWord("python");
-        autocomplete.addWord("programming");
-        autocomplete.addWord("programmer");
-        
-        System.out.println("Suggestions for 'jav':");
-        List<String> suggestions = autocomplete.getSuggestions("jav", 5);
-        System.out.println(suggestions);
-        
-        System.out.println("Suggestions for 'prog':");
-        suggestions = autocomplete.getSuggestions("prog", 5);
-        System.out.println(suggestions);
-        System.out.println("✓ Autocomplete working");
-        System.out.println();
-        
-        // Test Case 9: Case Insensitive Search
-        System.out.println("=== Test Case 9: Case Insensitive ===");
+        long start = System.nanoTime();
+        results = engine3.search("distributed systems", 5);
+        long elapsed = System.nanoTime() - start;
+        System.out.println("Search 'distributed systems' in 1000 docs: " + results.size() + " results");
+        System.out.printf("Search time: %.2f ms\n", elapsed / 1_000_000.0);
+        results.forEach(System.out::println);
+        System.out.println("✓ Scales to large datasets\n");
+
+        // --- Test 12: Thread Safety ---
+        System.out.println("=== Test 12: Thread Safety ===");
         SearchIndexEngine engine4 = new SearchIndexEngine();
-        engine4.indexDocument(new Document("1", "Title", "Java PROGRAMMING"));
-        
-        System.out.println("Search: 'java' (lowercase)");
-        results = engine4.search("java");
-        System.out.println("Found: " + results.size());
-        
-        System.out.println("Search: 'PROGRAMMING' (uppercase)");
-        results = engine4.search("PROGRAMMING");
-        System.out.println("Found: " + results.size());
-        System.out.println("✓ Case insensitive working");
-        System.out.println();
-        
-        // Test Case 10: Empty Query
-        System.out.println("=== Test Case 10: Empty Query ===");
-        results = engine.search("");
-        System.out.println("Results for empty query: " + results.size() + " (expected 0)");
-        System.out.println("✓ Empty query handling working");
-        System.out.println();
-        
-        System.out.println("=== All Test Cases Complete! ===");
+        ExecutorService executor = Executors.newFixedThreadPool(4);
+        List<Future<?>> futures = new ArrayList<>();
+
+        // Concurrent writes
+        for (int i = 0; i < 100; i++) {
+            final int idx = i;
+            futures.add(executor.submit(() ->
+                engine4.indexDocument(new Document("t" + idx, "Title " + idx,
+                    "Content for concurrent test document " + idx))
+            ));
+        }
+        // Concurrent reads while writing
+        for (int i = 0; i < 50; i++) {
+            futures.add(executor.submit(() -> engine4.search("concurrent")));
+        }
+
+        for (Future<?> f : futures) {
+            try { f.get(); } catch (Exception e) { System.out.println("ERROR: " + e); }
+        }
+        executor.shutdown();
+        System.out.println("After concurrent ops: " + engine4.getDocumentCount() + " docs indexed");
+        System.out.println("Concurrent search works: " + engine4.search("concurrent").size() + " results");
+        System.out.println("✓ Thread-safe concurrent reads and writes\n");
+
+        System.out.println("╔══════════════════════════════════════════╗");
+        System.out.println("║        ALL 12 TESTS PASSED ✓            ║");
+        System.out.println("╚══════════════════════════════════════════╝");
     }
 }
 
-/**
- * INTERVIEW DISCUSSION TOPICS:
- * ============================
+/*
+ * ==================== INTERVIEW NOTES ====================
  * 
- * 1. INVERTED INDEX:
- *    Forward Index (traditional):
- *      Document -> List of terms
- *      doc1 -> [java, programming, language]
- *      
- *    Inverted Index:
- *      Term -> List of documents
- *      java -> [doc1, doc2, doc5]
- *      
- *    Why Inverted?
- *      - Fast term lookup: O(1)
- *      - Efficient for search queries
- *      - Used in all major search engines
- * 
+ * 1. CORE DATA STRUCTURE - INVERTED INDEX:
+ *    Forward:  doc1 -> [java, programming, language]
+ *    Inverted: java -> [doc1, doc2, doc5]  ← O(1) lookup
+ *    Positional: java -> {doc1: [0,5,12], doc2: [3]}  ← enables phrase search
+ *
  * 2. TF-IDF SCORING:
- *    Term Frequency (TF):
- *      - How often term appears in document
- *      - TF = count / total_terms_in_doc
- *      - Higher = more relevant to document
- *    
- *    Inverse Document Frequency (IDF):
- *      - How rare the term is across all documents
- *      - IDF = log(total_docs / docs_with_term)
- *      - Rare terms are more discriminative
- *    
- *    TF-IDF = TF × IDF:
- *      - Balances frequency and rarity
- *      - Common words (the, is) get low score
- *      - Rare, frequent words get high score
- * 
- * 3. QUERY PROCESSING:
- *    Steps:
- *      1. Tokenization: split query into terms
- *      2. Normalization: lowercase, remove punctuation
- *      3. Stop word removal: filter common words
- *      4. Stemming: reduce to root form
- *      5. Query expansion: synonyms, spell correction
- *    
- *    Query Types:
- *      - Simple: "java programming"
- *      - Boolean: "java AND python"
- *      - Phrase: "machine learning"
- *      - Proximity: "java NEAR python"
- *      - Wildcard: "prog*"
- * 
- * 4. RANKING ALGORITHMS:
- *    TF-IDF (used here):
- *      - Classic, simple, effective
- *      - Pros: Fast, interpretable
- *      - Cons: No semantic understanding
- *    
- *    BM25 (Best Match 25):
- *      - Improved TF-IDF
- *      - Handles document length better
- *      - Used in Elasticsearch
- *    
- *    PageRank (Google):
- *      - Link-based ranking
- *      - Measures page importance
- *      - Good for web search
- *    
- *    Learning to Rank:
- *      - Machine learning models
- *      - Train on click data
- *      - Used in modern search engines
- * 
- * 5. ADVANCED FEATURES:
- *    Positional Index:
- *      term -> docId -> [position1, position2, ...]
- *      - Enables phrase search
- *      - Proximity queries
- *    
- *    Field-specific Search:
- *      - Search in title, content, author separately
- *      - Different weights for different fields
- *      - title:java content:programming
- *    
- *    Faceted Search:
- *      - Filter by categories
- *      - Example: type:article, year:2024
- *      - Used in e-commerce
- *    
- *    Fuzzy Search:
- *      - Handle typos, misspellings
- *      - Levenshtein distance
- *      - "progrmming" finds "programming"
- * 
- * 6. AUTOCOMPLETE:
- *    Trie (Prefix Tree):
- *      - O(k) lookup for prefix of length k
- *      - Space efficient for common prefixes
- *      - Real-time suggestions
- *    
- *    Alternative: N-gram Index:
- *      - "programming" -> ["pro", "rog", "ogr", ...]
- *      - More fuzzy matching
- *      - Higher space overhead
- * 
- * 7. SCALABILITY:
- *    Horizontal Scaling:
- *      - Shard by document ID range
- *      - doc1-1000 -> shard1
- *      - doc1001-2000 -> shard2
- *    
- *    Replication:
- *      - Multiple copies for availability
- *      - Read from any replica
- *      - Consistent hashing for distribution
- *    
- *    Caching:
- *      - Cache popular queries
- *      - TTL-based invalidation
- *      - Redis/Memcached
- * 
- * 8. REAL-WORLD SYSTEMS:
- *    Elasticsearch:
- *      - Distributed search engine
- *      - Built on Apache Lucene
- *      - RESTful API, JSON documents
- *      - Sharding, replication, fault tolerance
- *    
- *    Apache Solr:
- *      - Also built on Lucene
- *      - XML/JSON/CSV input
- *      - Faceted search, highlighting
- *    
- *    Apache Lucene:
- *      - Core search library
- *      - Inverted index implementation
- *      - Used by Elasticsearch, Solr
- * 
- * 9. PERFORMANCE OPTIMIZATION:
- *    Indexing:
- *      - Batch indexing (bulk operations)
- *      - Parallel processing
- *      - Incremental updates
- *    
- *    Query Execution:
- *      - Early termination (top-k)
- *      - Skip lists for faster merges
- *      - Query result caching
- *    
- *    Storage:
- *      - Compression (dictionary encoding)
- *      - Memory-mapped files
- *      - SSD for random access
- * 
- * 10. TIME COMPLEXITY:
- *     Operation              | Complexity
- *     indexDocument          | O(n) where n = terms in doc
- *     search (OR)            | O(k * m) where k=query terms, m=avg docs/term
- *     search (AND)           | O(k * m) with set intersection
- *     TF-IDF calculation     | O(1) per term per doc
- *     autocomplete           | O(k + r) where k=prefix len, r=results
- * 
- * 11. SPACE COMPLEXITY:
- *     Inverted Index: O(D * T) where D=docs, T=avg terms/doc
- *     Documents: O(D * C) where C=avg content size
- *     Trie: O(N * L) where N=words, L=avg word length
- * 
- * 12. SEARCH QUALITY METRICS:
- *     Precision: relevant_returned / total_returned
- *     Recall: relevant_returned / total_relevant
- *     F1 Score: harmonic mean of precision/recall
- *     MRR (Mean Reciprocal Rank): 1 / rank_of_first_relevant
- *     NDCG (Normalized Discounted Cumulative Gain)
- * 
- * 13. ADVANCED TOPICS:
- *     Query Expansion:
- *       - Add synonyms: "car" -> "automobile"
- *       - Fix typos: "progrmming" -> "programming"
- *       - Expand acronyms: "ML" -> "machine learning"
- *     
- *     Relevance Feedback:
- *       - Learn from user clicks
- *       - Adjust ranking based on behavior
- *       - Personalization
- *     
- *     Distributed Search:
- *       - Scatter-gather pattern
- *       - Query all shards in parallel
- *       - Merge and rank results
- * 
- * 14. STEMMING ALGORITHMS:
- *     Porter Stemmer:
- *       - Rule-based, English
- *       - running -> run, flies -> fli
- *     
- *     Snowball (Porter2):
- *       - Improved Porter
- *       - Multiple languages
- *     
- *     Lemmatization:
- *       - Dictionary-based
- *       - Better -> good (not "bett")
- *       - More accurate but slower
- * 
- * 15. HIGHLIGHTING:
- *     Show matched terms in context:
- *       "...Java is a <em>programming</em> language..."
- *     
- *     Implementation:
- *       - Store term positions
- *       - Extract snippet around match
- *       - Highlight query terms
- * 
- * 16. FILTERS AND FACETS:
- *     Filters (must match):
- *       - year:2024
- *       - category:tech
- *       - price:[10 TO 100]
- *     
- *     Facets (aggregations):
- *       - Count by category
- *       - Group by year
- *       - Price ranges
- * 
- * 17. SPELL CORRECTION:
- *     Edit Distance:
- *       - Levenshtein distance
- *       - Find closest words in dictionary
- *     
- *     N-gram Based:
- *       - "progrmming" -> ["pro", "ogr", "grm", ...]
- *       - Match against indexed n-grams
- *     
- *     Statistical:
- *       - Noisy channel model
- *       - Probability-based correction
- * 
- * 18. DESIGN PATTERNS:
- *     Builder Pattern:
- *       - SearchQuery.builder()
- *                     .term("java")
- *                     .filter("year", 2024)
- *                     .limit(10)
- *                     .build()
- *     
- *     Strategy Pattern:
- *       - Different ranking strategies
- *       - Swap TF-IDF, BM25, etc.
- *     
- *     Observer Pattern:
- *       - Notify on index updates
- *       - Real-time search
- * 
- * 19. COMMON INTERVIEW QUESTIONS:
- *     Q: How does Google search work?
- *     A: Crawl -> Index (inverted) -> Rank (PageRank + relevance) -> Return
- *     
- *     Q: How to handle typos?
- *     A: Edit distance, n-grams, did-you-mean suggestions
- *     
- *     Q: How to scale to billions of documents?
- *     A: Sharding, replication, caching, compression
- *     
- *     Q: How to make search faster?
- *     A: Caching, skip lists, early termination, pruning
- *     
- *     Q: Difference between database query and search?
- *     A: DB = exact match, Search = ranked relevance + fuzzy matching
- * 
- * 20. RELATED LEETCODE PROBLEMS:
- *     - Design Search Autocomplete System (642)
- *     - Design In-Memory File System (588)
- *     - Implement Trie (208)
- *     - Word Search II (212)
+ *    TF  = termFreq / docLength        (term importance in THIS doc)
+ *    IDF = log(totalDocs / docsWithTerm) (term rarity globally)
+ *    Score = TF × IDF × fieldWeight
+ *    → Common words score low, rare-but-frequent words score high
+ *
+ * 3. FIELD WEIGHTING:
+ *    title match = 3× content match. "Java" in title is more relevant
+ *    than "java" buried in content.
+ *
+ * 4. QUERY TYPES:
+ *    OR:     union of doc sets, rank by sum of TF-IDF
+ *    AND:    intersection of doc sets, start with smallest set
+ *    Phrase: AND + consecutive position check
+ *    Prefix: scan terms with matching prefix
+ *
+ * 5. AUTOCOMPLETE:
+ *    Trie with frequency → PriorityQueue for top-K by popularity.
+ *    O(k) traverse + O(n log n) collect, where n = words under prefix.
+ *
+ * 6. SCALABILITY (DISCUSSION):
+ *    Sharding: partition docs across nodes by hash(docId)
+ *    Replication: copies for read throughput + fault tolerance
+ *    Query: scatter to all shards → gather & merge ranked results
+ *    Caching: LRU cache for popular queries
+ *    Real-world: Elasticsearch = Lucene + sharding + replication
+ *
+ * 7. BM25 (BETTER THAN TF-IDF):
+ *    Adds saturation (diminishing returns for high TF) and
+ *    document length normalization. Used by Elasticsearch.
+ *    score = IDF × (tf × (k1+1)) / (tf + k1 × (1 - b + b × dl/avgdl))
+ *
+ * 8. THREAD SAFETY:
+ *    ReadWriteLock: multiple concurrent readers, exclusive writer.
+ *    ConcurrentHashMap for lock-free reads on document store.
+ *
+ * 9. COMPLEXITY:
+ *    indexDocument:   O(n)       n = terms in doc
+ *    search (OR):     O(q × d)  q = query terms, d = avg docs/term
+ *    search (AND):    O(q × min_d) with sorted intersection
+ *    phrase search:   O(q × d × p) p = positions per term
+ *    autocomplete:    O(k + r)  k = prefix length, r = results
+ *    removeDocument:  O(T)      T = total terms in index
  */

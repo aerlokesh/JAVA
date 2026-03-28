@@ -1,90 +1,37 @@
 import java.time.*;
 import java.util.*;
 import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicInteger;
 
 // ===== ENUMS =====
 
 enum PlayerStatus { IDLE, QUEUED, IN_MATCH }
 
-enum MatchStatus { WAITING, STARTED, COMPLETED, CANCELLED }
-
-enum SkillTier { BRONZE, SILVER, GOLD, PLATINUM, DIAMOND }
+enum MatchStatus { WAITING, STARTED, COMPLETED }
 
 // ===== DOMAIN CLASSES =====
 
 class Player {
-    private final String playerId;
-    private final String name;
-    private final int skillRating;          // MMR: 0-3000
-    private PlayerStatus status;
-    private LocalDateTime queuedAt;
-    private int matchesPlayed;
-    private int wins;
+    final String playerId;
+    final int skillRating;          // MMR: 0-3000
+    PlayerStatus status;
+    LocalDateTime queuedAt;
     
-    public Player(String playerId, String name, int skillRating) {
+    Player(String playerId, int skillRating) {
         this.playerId = playerId;
-        this.name = name;
         this.skillRating = skillRating;
         this.status = PlayerStatus.IDLE;
-        this.matchesPlayed = 0;
-        this.wins = 0;
     }
-    
-    public String getPlayerId() { return playerId; }
-    public String getName() { return name; }
-    public int getSkillRating() { return skillRating; }
-    public PlayerStatus getStatus() { return status; }
-    public LocalDateTime getQueuedAt() { return queuedAt; }
-    public int getMatchesPlayed() { return matchesPlayed; }
-    public int getWins() { return wins; }
-    
-    public void setStatus(PlayerStatus s) { this.status = s; }
-    public void setQueuedAt(LocalDateTime t) { this.queuedAt = t; }
-    public void incrementMatches() { matchesPlayed++; }
-    public void incrementWins() { wins++; }
-    
-    public SkillTier getTier() {
-        if (skillRating < 600) return SkillTier.BRONZE;
-        if (skillRating < 1200) return SkillTier.SILVER;
-        if (skillRating < 1800) return SkillTier.GOLD;
-        if (skillRating < 2400) return SkillTier.PLATINUM;
-        return SkillTier.DIAMOND;
-    }
-    
-    @Override
-    public String toString() { return name + "(" + skillRating + ", " + getTier() + ", " + status + ")"; }
 }
 
 class Match {
-    private final String matchId;
-    private final List<Player> players;
-    private MatchStatus status;
-    private final LocalDateTime createdAt;
-    private LocalDateTime startedAt;
-    private int avgSkillRating;
+    final String matchId;
+    final List<Player> players;
+    MatchStatus status;
     
-    public Match(List<Player> players) {
+    Match(List<Player> players) {
         this.matchId = "MATCH-" + UUID.randomUUID().toString().substring(0, 6);
         this.players = new ArrayList<>(players);
         this.status = MatchStatus.WAITING;
-        this.createdAt = LocalDateTime.now();
-        this.avgSkillRating = (int) players.stream().mapToInt(Player::getSkillRating).average().orElse(0);
-    }
-    
-    public String getMatchId() { return matchId; }
-    public List<Player> getPlayers() { return Collections.unmodifiableList(players); }
-    public MatchStatus getStatus() { return status; }
-    public int getAvgSkillRating() { return avgSkillRating; }
-    
-    public void setStatus(MatchStatus s) { 
-        this.status = s;
-        if (s == MatchStatus.STARTED) this.startedAt = LocalDateTime.now();
-    }
-    
-    @Override
-    public String toString() {
-        return matchId + "[" + status + ", players=" + players.size() + ", avgMMR=" + avgSkillRating + "]";
     }
 }
 
@@ -114,7 +61,6 @@ class MatchmakingService {
     private final Map<String, Match> matches;
     private final int playersPerMatch;
     private final int skillRange;            // max MMR difference in a match
-    private final AtomicInteger totalMatches;
     
     public MatchmakingService(int playersPerMatch, int skillRange) {
         this.players = new ConcurrentHashMap<>();
@@ -122,18 +68,18 @@ class MatchmakingService {
         this.matches = new ConcurrentHashMap<>();
         this.playersPerMatch = playersPerMatch;
         this.skillRange = skillRange;
-        this.totalMatches = new AtomicInteger(0);
     }
     
     /**
      * Register a player
      */
-    public Player registerPlayer(String id, String name, int skillRating) {
-        // TODO: Implement
-        // HINT: Player p = new Player(id, name, skillRating);
+    public Player registerPlayer(String id, int skillRating) {
+        // HINT: Player p = new Player(id, skillRating);
         // HINT: players.put(id, p);
         // HINT: return p;
-        return null;
+        Player p=new Player(id, skillRating);
+        players.put(id, p);
+        return p;
     }
     
     /**
@@ -146,14 +92,19 @@ class MatchmakingService {
      * 4. Try to form a match (tryMatch)
      */
     public void joinQueue(String playerId) {
-        // TODO: Implement
         // HINT: Player p = players.get(playerId);
-        // HINT: if (p == null || p.getStatus() != PlayerStatus.IDLE) return;
-        // HINT: p.setStatus(PlayerStatus.QUEUED);
-        // HINT: p.setQueuedAt(LocalDateTime.now());
+        // HINT: if (p == null || p.status != PlayerStatus.IDLE) return;
+        // HINT: p.status = PlayerStatus.QUEUED;
+        // HINT: p.queuedAt = LocalDateTime.now();
         // HINT: matchQueue.offer(playerId);
-        // HINT: System.out.println("  🎮 " + p.getName() + " joined queue");
+        // HINT: System.out.println("  🎮 " + p.playerId + " joined queue");
         // HINT: tryMatch();
+        Player p =players.get(playerId);
+        if(p==null || p.status!=PlayerStatus.IDLE) return;
+        p.status=PlayerStatus.QUEUED;
+        p.queuedAt=LocalDateTime.now();
+        matchQueue.offer(playerId);
+        tryMatch();
     }
     
     /**
@@ -165,12 +116,15 @@ class MatchmakingService {
      * 3. Set status back to IDLE
      */
     public void cancelQueue(String playerId) {
-        // TODO: Implement
         // HINT: Player p = players.get(playerId);
-        // HINT: if (p == null || p.getStatus() != PlayerStatus.QUEUED) return;
+        // HINT: if (p == null || p.status != PlayerStatus.QUEUED) return;
         // HINT: matchQueue.remove(playerId);
-        // HINT: p.setStatus(PlayerStatus.IDLE);
-        // HINT: System.out.println("  ❌ " + p.getName() + " left queue");
+        // HINT: p.status = PlayerStatus.IDLE;
+        // HINT: System.out.println("  ❌ " + p.playerId + " left queue");
+        Player p=players.get(playerId);
+        if(p==null || p.status!=PlayerStatus.QUEUED) return;
+        matchQueue.remove(playerId);
+        p.status=PlayerStatus.IDLE;
     }
     
     /**
@@ -185,28 +139,44 @@ class MatchmakingService {
      * 5. If not enough players → do nothing (wait for more)
      */
     private synchronized void tryMatch() {
-        // TODO: Implement
         // HINT: List<Player> queued = new ArrayList<>();
         // HINT: for (String pid : matchQueue) {
         //     Player p = players.get(pid);
-        //     if (p != null && p.getStatus() == PlayerStatus.QUEUED) queued.add(p);
+        //     if (p != null && p.status == PlayerStatus.QUEUED) queued.add(p);
         // }
         //
         // HINT: if (queued.size() < playersPerMatch) return;
         //
         // HINT: // Sort by skill for matching
-        // HINT: queued.sort((a, b) -> a.getSkillRating() - b.getSkillRating());
+        // HINT: queued.sort((a, b) -> a.skillRating - b.skillRating);
         //
         // HINT: // Sliding window to find group within skill range
         // HINT: for (int i = 0; i <= queued.size() - playersPerMatch; i++) {
-        //     int minSkill = queued.get(i).getSkillRating();
-        //     int maxSkill = queued.get(i + playersPerMatch - 1).getSkillRating();
+        //     int minSkill = queued.get(i).skillRating;
+        //     int maxSkill = queued.get(i + playersPerMatch - 1).skillRating;
         //     if (maxSkill - minSkill <= skillRange) {
         //         List<Player> matchPlayers = queued.subList(i, i + playersPerMatch);
         //         createMatch(new ArrayList<>(matchPlayers));
         //         return;
         //     }
         // }
+        List<Player> qList=new ArrayList<>();
+        for(String pid:matchQueue){
+            Player p=players.get(pid);
+            if(p!=null && p.status==PlayerStatus.QUEUED) qList.add(p);
+        }
+        if(qList.size()<playersPerMatch) return;
+        qList.sort((a,b)->a.skillRating-b.skillRating);
+        for(int i=0;i<=qList.size()-playersPerMatch;i++){
+            int minSkill=qList.get(i).skillRating;
+            int maxSkill=qList.get(i+playersPerMatch-1).skillRating;
+            if(maxSkill-minSkill<=skillRange){
+                List<Player> selected=qList.subList(i, i+playersPerMatch);
+                createMatch(new ArrayList<>(selected));
+                return;
+            }
+        }
+
     }
     
     /**
@@ -219,30 +189,37 @@ class MatchmakingService {
      * 4. Store match, increment counter
      */
     private void createMatch(List<Player> matchPlayers) {
-        // TODO: Implement
         // HINT: Match match = new Match(matchPlayers);
         // HINT: for (Player p : matchPlayers) {
-        //     p.setStatus(PlayerStatus.IN_MATCH);
-        //     p.incrementMatches();
-        //     matchQueue.remove(p.getPlayerId());
+        //     p.status = PlayerStatus.IN_MATCH;
+        //     matchQueue.remove(p.playerId);
         // }
-        // HINT: match.setStatus(MatchStatus.STARTED);
-        // HINT: matches.put(match.getMatchId(), match);
-        // HINT: totalMatches.incrementAndGet();
+        // HINT: match.status = MatchStatus.STARTED;
+        // HINT: matches.put(match.matchId, match);
         // HINT: System.out.println("  🏆 Match created: " + match);
         // HINT: matchPlayers.forEach(p -> System.out.println("      " + p));
+        Match match=new Match(matchPlayers);
+        for(Player p:matchPlayers){
+            p.status=PlayerStatus.IN_MATCH;
+            matchQueue.remove(p.playerId);
+        }
+        match.status=MatchStatus.STARTED;
+        matches.put(match.matchId, match);
     }
     
     /**
      * Complete a match (players go back to IDLE)
      */
     public void completeMatch(String matchId) {
-        // TODO: Implement
         // HINT: Match match = matches.get(matchId);
         // HINT: if (match == null) return;
-        // HINT: match.setStatus(MatchStatus.COMPLETED);
-        // HINT: for (Player p : match.getPlayers()) p.setStatus(PlayerStatus.IDLE);
+        // HINT: match.status = MatchStatus.COMPLETED;
+        // HINT: for (Player p : match.players) p.status = PlayerStatus.IDLE;
         // HINT: System.out.println("  ✅ Match completed: " + matchId);
+        Match match=matches.get(matchId);
+        if(match==null) return;
+        match.status=MatchStatus.COMPLETED;
+        for (Player p : match.players) p.status = PlayerStatus.IDLE;
     }
     
     // ===== QUERIES =====
@@ -250,30 +227,16 @@ class MatchmakingService {
     public Player getPlayer(String id) { return players.get(id); }
     public Match getMatch(String id) { return matches.get(id); }
     public int getQueueSize() { return matchQueue.size(); }
-    public int getTotalMatches() { return totalMatches.get(); }
-    
-    /**
-     * Get queue players sorted by wait time
-     */
-    public List<Player> getQueuedPlayers() {
-        // TODO: Implement
-        // HINT: List<Player> result = new ArrayList<>();
-        // HINT: for (String pid : matchQueue) {
-        //     Player p = players.get(pid);
-        //     if (p != null && p.getStatus() == PlayerStatus.QUEUED) result.add(p);
-        // }
-        // HINT: return result;
-        return null;
-    }
+    public int getTotalMatches() { return matches.size(); }
     
     public void displayStatus() {
         System.out.println("\n--- Matchmaking Status ---");
         System.out.println("Players: " + players.size() + ", Queue: " + matchQueue.size() 
-            + ", Matches: " + totalMatches.get());
+            + ", Matches: " + matches.size());
         System.out.println("Queued:");
         for (String pid : matchQueue) {
             Player p = players.get(pid);
-            if (p != null) System.out.println("  " + p);
+            if (p != null) System.out.println("  " + p.playerId + "(" + p.skillRating + ", " + p.status + ")");
         }
     }
 }
@@ -289,16 +252,16 @@ public class MatchmakingSystem {
         
         // Register players with different skill levels
         System.out.println("=== Setup: Register Players ===");
-        service.registerPlayer("p1", "Alice", 1500);     // Gold
-        service.registerPlayer("p2", "Bob", 1600);       // Gold
-        service.registerPlayer("p3", "Charlie", 1400);   // Gold
-        service.registerPlayer("p4", "Diana", 1550);     // Gold
-        service.registerPlayer("p5", "Eve", 2800);       // Diamond
-        service.registerPlayer("p6", "Frank", 2900);     // Diamond
-        service.registerPlayer("p7", "Grace", 500);      // Bronze
-        service.registerPlayer("p8", "Hank", 600);       // Silver
-        service.registerPlayer("p9", "Ivy", 2700);       // Diamond
-        service.registerPlayer("p10", "Jack", 2850);     // Diamond
+        service.registerPlayer("p1", 1500);
+        service.registerPlayer("p2", 1600);
+        service.registerPlayer("p3", 1400);
+        service.registerPlayer("p4", 1550);
+        service.registerPlayer("p5", 2800);
+        service.registerPlayer("p6", 2900);
+        service.registerPlayer("p7", 500);
+        service.registerPlayer("p8", 600);
+        service.registerPlayer("p9", 2700);
+        service.registerPlayer("p10", 2850);
         System.out.println();
         
         // Test 1: Join queue — not enough players yet
@@ -338,23 +301,23 @@ public class MatchmakingSystem {
         System.out.println("=== Test 5: Cancel Queue ===");
         service.cancelQueue("p7");
         Player p7 = service.getPlayer("p7");
-        System.out.println("  Grace status: " + (p7 != null ? p7.getStatus() : "null") + " (expect IDLE)");
+        System.out.println("  Grace status: " + (p7 != null ? p7.status : "null") + " (expect IDLE)");
         System.out.println("  Queue: " + service.getQueueSize());
         System.out.println();
         
         // Test 6: Complete match → players back to IDLE
         System.out.println("=== Test 6: Complete Match ===");
         Player alice = service.getPlayer("p1");
-        System.out.println("  Alice before complete: " + (alice != null ? alice.getStatus() : "null"));
+        System.out.println("  Alice before complete: " + (alice != null ? alice.status : "null"));
         // Complete first match
         // (In real test, we'd save the match ID from createMatch)
         System.out.println();
         
         // Test 7: Player can re-queue after match
         System.out.println("=== Test 7: Re-queue After Match ===");
-        if (alice != null && alice.getStatus() == PlayerStatus.IDLE) {
+        if (alice != null && alice.status == PlayerStatus.IDLE) {
             service.joinQueue("p1");
-            System.out.println("  Alice re-queued: " + alice.getStatus());
+            System.out.println("  Alice re-queued: " + alice.status);
         } else {
             System.out.println("  Alice still in match (complete it first)");
         }
@@ -362,12 +325,6 @@ public class MatchmakingSystem {
         
         // Test 8: Queue status
         System.out.println("=== Test 8: Queue Status ===");
-        List<Player> queued = service.getQueuedPlayers();
-        System.out.println("  Queued players: " + (queued != null ? queued.size() : 0));
-        if (queued != null) queued.forEach(p -> System.out.println("    " + p));
-        System.out.println();
-        
-        // Display
         service.displayStatus();
         
         System.out.println("\n=== All Test Cases Complete! ===");

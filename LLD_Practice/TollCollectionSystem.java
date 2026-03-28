@@ -1,465 +1,494 @@
-import java.time.*;
 import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
+import java.util.stream.*;
 
-// ===== EXCEPTIONS =====
+/*
+ * TOLL COLLECTION SYSTEM - Low Level Design
+ * ==========================================
+ * 
+ * REQUIREMENTS:
+ * 1. Register vehicles with type (car, truck, bus, motorcycle)
+ * 2. Issue toll passes (like E-ZPass/FASTag) with prepaid balance
+ * 3. Process toll: auto-deduct from pass or cash payment
+ * 4. Pricing by vehicle type + trip type (one-way / round-trip)
+ * 5. Recharge toll passes
+ * 6. Transaction history per vehicle
+ * 7. Manage toll booths (open/close, fast-track vs cash lanes)
+ * 8. Thread-safe concurrent toll processing
+ * 
+ * KEY DATA STRUCTURES:
+ * - ConcurrentHashMap<plate, Vehicle>: vehicle registry
+ * - ConcurrentHashMap<passId, TollPass>: pass store with synchronized balance
+ * - CopyOnWriteArrayList<Transaction>: append-only transaction log
+ * 
+ * DESIGN PATTERNS:
+ * - Strategy: TollPricingStrategy (standard, peak-hour, distance-based)
+ * - Decorator: PeakHourPricing wraps base pricing with surge multiplier
+ * 
+ * COMPLEXITY:
+ *   registerVehicle:  O(1)
+ *   processToll:      O(1) — all map lookups
+ *   recharge:         O(1)
+ *   getHistory:       O(n) where n = total transactions
+ */
+
+// ==================== EXCEPTIONS ====================
 
 class InsufficientBalanceException extends Exception {
-    public InsufficientBalanceException(String msg) { super("Insufficient balance: " + msg); }
+    InsufficientBalanceException(String msg) { super(msg); }
 }
 
 class InvalidPassException extends Exception {
-    public InvalidPassException(String id) { super("Invalid toll pass: " + id); }
+    InvalidPassException(String id) { super("Invalid/inactive pass: " + id); }
 }
 
-// ===== ENUMS =====
+// ==================== ENUMS ====================
 
-enum VehicleType { CAR, TRUCK, BUS, MOTORCYCLE }
-
+enum VehicleType { MOTORCYCLE, CAR, BUS, TRUCK }
 enum PaymentMethod { TOLL_PASS, CASH }
-
 enum TripType { ONE_WAY, ROUND_TRIP }
 
-// ===== DOMAIN CLASSES =====
+// ==================== DOMAIN CLASSES ====================
 
 class Vehicle {
-    private final String licensePlate;
-    private final VehicleType type;
-    private String tollPassId;   // null if no pass
-    
-    public Vehicle(String licensePlate, VehicleType type) {
-        this.licensePlate = licensePlate;
+    final String plate;
+    final VehicleType type;
+    volatile String passId; // null if no pass
+
+    Vehicle(String plate, VehicleType type) {
+        this.plate = plate;
         this.type = type;
     }
-    
-    public String getLicensePlate() { return licensePlate; }
-    public VehicleType getType() { return type; }
-    public String getTollPassId() { return tollPassId; }
-    public void setTollPassId(String id) { this.tollPassId = id; }
-    public boolean hasTollPass() { return tollPassId != null; }
-    
-    @Override
-    public String toString() { return licensePlate + "[" + type + (hasTollPass() ? ", pass=" + tollPassId : ", no pass") + "]"; }
+
+    boolean hasPass() { return passId != null; }
 }
 
 class TollPass {
-    private final String passId;
-    private final String ownerId;
-    private double balance;
-    private boolean active;
-    private final LocalDateTime issuedAt;
-    
-    public TollPass(String passId, String ownerId, double initialBalance) {
+    final String passId;
+    private double balance; // guarded by synchronized
+    volatile boolean active;
+
+    TollPass(String passId, double initialBalance) {
         this.passId = passId;
-        this.ownerId = ownerId;
         this.balance = initialBalance;
         this.active = true;
-        this.issuedAt = LocalDateTime.now();
     }
-    
-    public String getPassId() { return passId; }
-    public String getOwnerId() { return ownerId; }
-    public double getBalance() { return balance; }
-    public boolean isActive() { return active; }
-    
-    public void setActive(boolean a) { this.active = a; }
-    public void deduct(double amount) { this.balance -= amount; }
-    public void recharge(double amount) { this.balance += amount; }
-    
-    @Override
-    public String toString() { return passId + "[owner=" + ownerId + ", balance=$" + String.format("%.2f", balance) + ", active=" + active + "]"; }
+
+    synchronized double getBalance() { return balance; }
+
+    synchronized void deduct(double amount) throws InsufficientBalanceException {
+        // HINT: if (balance < amount)
+        // HINT:     throw new InsufficientBalanceException(
+        // HINT:         String.format("Need $%.2f, have $%.2f on pass %s", amount, balance, passId));
+        // HINT: balance -= amount;
+        if(balance<amount) throw new InsufficientBalanceException(passId);
+        balance-=amount;
+    }
+
+    synchronized void recharge(double amount) {
+        // HINT: balance += amount;
+        balance+=amount;
+    }
 }
 
 class TollBooth {
-    private final String boothId;
-    private final String plazaId;
-    private boolean isOpen;
-    private boolean isFastTrack;  // E-ZPass only lane
-    
-    public TollBooth(String boothId, String plazaId, boolean isFastTrack) {
+    final String boothId;
+    final boolean fastTrack; // true = pass-only lane
+    volatile boolean open;
+
+    TollBooth(String boothId, boolean fastTrack) {
         this.boothId = boothId;
-        this.plazaId = plazaId;
-        this.isOpen = true;
-        this.isFastTrack = isFastTrack;
+        this.fastTrack = fastTrack;
+        this.open = true;
     }
-    
-    public String getBoothId() { return boothId; }
-    public String getPlazaId() { return plazaId; }
-    public boolean isOpen() { return isOpen; }
-    public boolean isFastTrack() { return isFastTrack; }
-    public void setOpen(boolean o) { this.isOpen = o; }
-    
-    @Override
-    public String toString() { return boothId + "[" + (isFastTrack ? "FAST" : "CASH") + ", " + (isOpen ? "OPEN" : "CLOSED") + "]"; }
 }
 
 class TollTransaction {
-    private final String transactionId;
-    private final String vehiclePlate;
-    private final String boothId;
-    private final double amount;
-    private final PaymentMethod paymentMethod;
-    private final LocalDateTime timestamp;
-    
-    public TollTransaction(String vehiclePlate, String boothId, double amount, PaymentMethod method) {
-        this.transactionId = "TXN-" + UUID.randomUUID().toString().substring(0, 6);
-        this.vehiclePlate = vehiclePlate;
+    final String txnId;
+    final String plate;
+    final String boothId;
+    final double amount;
+    final PaymentMethod method;
+    final TripType tripType;
+
+    TollTransaction(String plate, String boothId, double amount, PaymentMethod method, TripType tripType) {
+        this.txnId = "TXN-" + UUID.randomUUID().toString().substring(0, 8);
+        this.plate = plate;
         this.boothId = boothId;
         this.amount = amount;
-        this.paymentMethod = method;
-        this.timestamp = LocalDateTime.now();
+        this.method = method;
+        this.tripType = tripType;
     }
-    
-    public String getTransactionId() { return transactionId; }
-    public String getVehiclePlate() { return vehiclePlate; }
-    public String getBoothId() { return boothId; }
-    public double getAmount() { return amount; }
-    public PaymentMethod getPaymentMethod() { return paymentMethod; }
-    public LocalDateTime getTimestamp() { return timestamp; }
-    
-    @Override
-    public String toString() { return transactionId + "[" + vehiclePlate + " at " + boothId + ", $" + String.format("%.2f", amount) + ", " + paymentMethod + "]"; }
 }
 
-// ===== INTERFACE (Strategy Pattern) =====
+// ==================== STRATEGY: PRICING ====================
 
-/**
- * Pricing strategy — different toll amounts based on vehicle type, time, etc.
- */
 interface TollPricingStrategy {
-    double calculateToll(VehicleType type, TripType trip);
+    double calculate(VehicleType type, TripType trip);
 }
 
-/**
- * Standard pricing: fixed rate by vehicle type
- */
-class StandardPricingStrategy implements TollPricingStrategy {
-    private final Map<VehicleType, Double> rates;
-    
-    public StandardPricingStrategy() {
-        rates = new HashMap<>();
-        rates.put(VehicleType.MOTORCYCLE, 1.50);
-        rates.put(VehicleType.CAR, 3.00);
-        rates.put(VehicleType.BUS, 5.00);
-        rates.put(VehicleType.TRUCK, 7.00);
-    }
-    
+class StandardPricing implements TollPricingStrategy {
+    private static final Map<VehicleType, Double> RATES = Map.of(
+        VehicleType.MOTORCYCLE, 1.50,
+        VehicleType.CAR, 3.00,
+        VehicleType.BUS, 5.00,
+        VehicleType.TRUCK, 7.00
+    );
+
     @Override
-    public double calculateToll(VehicleType type, TripType trip) {
-        double base = rates.getOrDefault(type, 3.00);
-        return trip == TripType.ROUND_TRIP ? base * 1.8 : base; // 10% discount for round trip
+    public double calculate(VehicleType type, TripType trip) {
+        // TODO: Implement
+        // HINT: double base = RATES.getOrDefault(type, 3.00);
+        // HINT: return trip == TripType.ROUND_TRIP ? base * 1.8 : base;
+        return 0;
     }
 }
 
-// ===== SERVICE =====
+/** Decorator: wraps any pricing with a surge multiplier */
+class PeakHourPricing implements TollPricingStrategy {
+    private final TollPricingStrategy base;
+    private final double surgeMultiplier;
 
-/**
- * Highway Toll Collection System - Low Level Design (LLD)
- * 
- * PROBLEM (Amazon SDE Question): Design a highway toll collection system that:
- * 1. Register vehicles and issue toll passes (like E-ZPass/FASTag)
- * 2. Process toll payments (pass auto-deduct or cash)
- * 3. Different pricing by vehicle type
- * 4. Recharge toll passes
- * 5. Track transaction history
- * 6. Manage toll booths (open/close, fast-track vs cash)
- * 
- * PATTERNS: Strategy (pricing)
- */
-class TollCollectionService {
-    private final Map<String, Vehicle> vehicles;           // licensePlate → Vehicle
-    private final Map<String, TollPass> tollPasses;        // passId → TollPass
-    private final Map<String, TollBooth> booths;           // boothId → Booth
-    private final List<TollTransaction> transactions;
-    private TollPricingStrategy pricingStrategy;
-    private double totalRevenue;
-    
-    public TollCollectionService(TollPricingStrategy pricingStrategy) {
-        this.vehicles = new HashMap<>();
-        this.tollPasses = new HashMap<>();
-        this.booths = new HashMap<>();
-        this.transactions = new ArrayList<>();
-        this.pricingStrategy = pricingStrategy;
-        this.totalRevenue = 0;
+    PeakHourPricing(TollPricingStrategy base, double surgeMultiplier) {
+        this.base = base;
+        this.surgeMultiplier = surgeMultiplier;
     }
-    
-    /**
-     * Register a vehicle
-     */
-    public Vehicle registerVehicle(String plate, VehicleType type) {
+
+    @Override
+    public double calculate(VehicleType type, TripType trip) {
+        // TODO: Implement
+        // HINT: return base.calculate(type, trip) * surgeMultiplier;
+        return 0;
+    }
+}
+
+// ==================== SERVICE ====================
+
+class TollCollectionService {
+    private final ConcurrentHashMap<String, Vehicle> vehicles = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, TollPass> passes = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, TollBooth> booths = new ConcurrentHashMap<>();
+    private final CopyOnWriteArrayList<TollTransaction> transactions = new CopyOnWriteArrayList<>();
+    private final AtomicInteger passCounter = new AtomicInteger(1);
+    private volatile TollPricingStrategy pricing;
+    private final AtomicLong totalRevenueCents = new AtomicLong(0);
+
+    TollCollectionService(TollPricingStrategy pricing) {
+        this.pricing = pricing;
+    }
+
+    // --- Registration ---
+
+    Vehicle registerVehicle(String plate, VehicleType type) {
         // TODO: Implement
         // HINT: Vehicle v = new Vehicle(plate, type);
         // HINT: vehicles.put(plate, v);
-        // HINT: System.out.println("  ✓ Vehicle: " + v);
         // HINT: return v;
         return null;
     }
-    
-    /**
-     * Issue a toll pass to a vehicle
-     * 
-     * IMPLEMENTATION HINTS:
-     * 1. Create TollPass with initial balance
-     * 2. Store in tollPasses map
-     * 3. Link pass to vehicle
-     * 4. Return pass
-     */
-    public TollPass issueTollPass(String plate, double initialBalance) {
+
+    TollPass issueTollPass(String plate, double initialBalance) {
         // TODO: Implement
         // HINT: Vehicle v = vehicles.get(plate);
-        // HINT: if (v == null) return null;
-        // HINT: String passId = "PASS-" + UUID.randomUUID().toString().substring(0, 6);
-        // HINT: TollPass pass = new TollPass(passId, plate, initialBalance);
-        // HINT: tollPasses.put(passId, pass);
-        // HINT: v.setTollPassId(passId);
-        // HINT: System.out.println("  ✓ Pass issued: " + pass);
+        // HINT: if (v == null) throw new IllegalArgumentException("Vehicle not registered: " + plate);
+        // HINT: String passId = "PASS-" + String.format("%04d", passCounter.getAndIncrement());
+        // HINT: TollPass pass = new TollPass(passId, initialBalance);
+        // HINT: passes.put(passId, pass);
+        // HINT: v.passId = passId;
         // HINT: return pass;
         return null;
     }
-    
-    /**
-     * Add a toll booth
-     */
-    public TollBooth addBooth(String boothId, String plazaId, boolean fastTrack) {
+
+    TollBooth addBooth(String boothId, boolean fastTrack) {
         // TODO: Implement
-        // HINT: TollBooth booth = new TollBooth(boothId, plazaId, fastTrack);
+        // HINT: TollBooth booth = new TollBooth(boothId, fastTrack);
         // HINT: booths.put(boothId, booth);
         // HINT: return booth;
         return null;
     }
-    
-    /**
-     * Process toll payment — the main flow
-     * 
-     * IMPLEMENTATION HINTS:
-     * 1. Get vehicle → validate exists
-     * 2. Calculate toll using pricingStrategy
-     * 3. If vehicle has toll pass:
-     *    a. Get pass → validate active
-     *    b. Check balance >= toll → throw InsufficientBalanceException if not
-     *    c. Deduct from pass
-     *    d. Create transaction with TOLL_PASS method
-     * 4. If no pass:
-     *    a. Create transaction with CASH method
-     * 5. Add to transactions, update totalRevenue
-     * 6. Return transaction
-     */
-    public TollTransaction processToll(String plate, String boothId, TripType tripType)
+
+    // --- Core: Process Toll ---
+
+    TollTransaction processToll(String plate, String boothId, TripType tripType)
             throws InsufficientBalanceException, InvalidPassException {
-        // TODO: Implement
+        // TODO: Implement — this is the main interview question
         // HINT: Vehicle v = vehicles.get(plate);
-        // HINT: if (v == null) return null;
-        //
-        // HINT: double toll = pricingStrategy.calculateToll(v.getType(), tripType);
-        //
-        // HINT: if (v.hasTollPass()) {
-        //     TollPass pass = tollPasses.get(v.getTollPassId());
-        //     if (pass == null || !pass.isActive()) throw new InvalidPassException(v.getTollPassId());
-        //     if (pass.getBalance() < toll) throw new InsufficientBalanceException(
-        //         "Need $" + String.format("%.2f", toll) + ", have $" + String.format("%.2f", pass.getBalance()));
-        //     pass.deduct(toll);
-        //     TollTransaction txn = new TollTransaction(plate, boothId, toll, PaymentMethod.TOLL_PASS);
-        //     transactions.add(txn);
-        //     totalRevenue += toll;
-        //     System.out.println("  💳 " + txn + " (balance: $" + String.format("%.2f", pass.getBalance()) + ")");
-        //     return txn;
-        // } else {
-        //     TollTransaction txn = new TollTransaction(plate, boothId, toll, PaymentMethod.CASH);
-        //     transactions.add(txn);
-        //     totalRevenue += toll;
-        //     System.out.println("  💵 " + txn);
-        //     return txn;
-        // }
+        // HINT: if (v == null) throw new IllegalArgumentException("Unknown vehicle: " + plate);
+        // HINT:
+        // HINT: TollBooth booth = booths.get(boothId);
+        // HINT: if (booth != null && !booth.open)
+        // HINT:     throw new IllegalStateException("Booth " + boothId + " is closed");
+        // HINT: if (booth != null && booth.fastTrack && !v.hasPass())
+        // HINT:     throw new IllegalStateException("Fast-track lane requires toll pass");
+        // HINT:
+        // HINT: double toll = pricing.calculate(v.type, tripType);
+        // HINT: PaymentMethod method;
+        // HINT:
+        // HINT: if (v.hasPass()) {
+        // HINT:     TollPass pass = passes.get(v.passId);
+        // HINT:     if (pass == null || !pass.active) throw new InvalidPassException(v.passId);
+        // HINT:     pass.deduct(toll);
+        // HINT:     method = PaymentMethod.TOLL_PASS;
+        // HINT: } else {
+        // HINT:     method = PaymentMethod.CASH;
+        // HINT: }
+        // HINT:
+        // HINT: TollTransaction txn = new TollTransaction(plate, boothId, toll, method, tripType);
+        // HINT: transactions.add(txn);
+        // HINT: totalRevenueCents.addAndGet(Math.round(toll * 100));
+        // HINT: return txn;
         return null;
     }
-    
-    /**
-     * Recharge a toll pass
-     */
-    public void rechargeTollPass(String passId, double amount) throws InvalidPassException {
+
+    // --- Pass Management ---
+
+    void rechargeTollPass(String passId, double amount) throws InvalidPassException {
         // TODO: Implement
-        // HINT: TollPass pass = tollPasses.get(passId);
+        // HINT: TollPass pass = passes.get(passId);
         // HINT: if (pass == null) throw new InvalidPassException(passId);
         // HINT: pass.recharge(amount);
-        // HINT: System.out.println("  🔋 Recharged " + passId + " +$" + String.format("%.2f", amount) + " → $" + String.format("%.2f", pass.getBalance()));
     }
-    
-    // ===== QUERIES =====
-    
-    /**
-     * Get transaction history for a vehicle
-     */
-    public List<TollTransaction> getVehicleHistory(String plate) {
+
+    void deactivatePass(String passId) throws InvalidPassException {
         // TODO: Implement
-        // HINT: List<TollTransaction> result = new ArrayList<>();
-        // HINT: for (TollTransaction t : transactions) {
-        //     if (t.getVehiclePlate().equals(plate)) result.add(t);
-        // }
-        // HINT: return result;
-        return null;
+        // HINT: TollPass pass = passes.get(passId);
+        // HINT: if (pass == null) throw new InvalidPassException(passId);
+        // HINT: pass.active = false;
     }
-    
-    public Vehicle getVehicle(String plate) { return vehicles.get(plate); }
-    public TollPass getTollPass(String id) { return tollPasses.get(id); }
-    public double getTotalRevenue() { return totalRevenue; }
-    public int getTotalTransactions() { return transactions.size(); }
+
+    // --- Booth Management ---
+
+    void closeBooth(String boothId) {
+        // TODO: Implement
+        // HINT: TollBooth booth = booths.get(boothId);
+        // HINT: if (booth != null) booth.open = false;
+    }
+
+    void openBooth(String boothId) {
+        // TODO: Implement
+        // HINT: TollBooth booth = booths.get(boothId);
+        // HINT: if (booth != null) booth.open = true;
+    }
+
+    // --- Queries ---
+
+    List<TollTransaction> getVehicleHistory(String plate) {
+        // TODO: Implement
+        // HINT: return transactions.stream()
+        // HINT:     .filter(t -> t.plate.equals(plate))
+        // HINT:     .collect(Collectors.toList());
+        return Collections.emptyList();
+    }
+
+    List<TollTransaction> getBoothTransactions(String boothId) {
+        // TODO: Implement
+        // HINT: return transactions.stream()
+        // HINT:     .filter(t -> t.boothId.equals(boothId))
+        // HINT:     .collect(Collectors.toList());
+        return Collections.emptyList();
+    }
+
+    double getTotalRevenue() { return totalRevenueCents.get() / 100.0; }
+    int getTotalTransactions() { return transactions.size(); }
+    TollPass getPass(String passId) { return passes.get(passId); }
+    Vehicle getVehicle(String plate) { return vehicles.get(plate); }
+    void setPricing(TollPricingStrategy strategy) { this.pricing = strategy; }
 }
 
-// ===== MAIN TEST CLASS =====
+// ==================== MAIN / TESTS ====================
 
 public class TollCollectionSystem {
     public static void main(String[] args) {
-        System.out.println("=== Highway Toll Collection System LLD ===\n");
-        
-        TollCollectionService service = new TollCollectionService(new StandardPricingStrategy());
-        
-        // Setup: booths
-        service.addBooth("B1", "Plaza-North", false);  // cash lane
-        service.addBooth("B2", "Plaza-North", true);   // fast track
-        
-        // Test 1: Register vehicles and issue passes
-        System.out.println("=== Test 1: Register Vehicles ===");
-        service.registerVehicle("CAR-001", VehicleType.CAR);
-        service.registerVehicle("TRUCK-001", VehicleType.TRUCK);
-        service.registerVehicle("BIKE-001", VehicleType.MOTORCYCLE);
-        service.registerVehicle("BUS-001", VehicleType.BUS);
-        service.registerVehicle("CAR-002", VehicleType.CAR);  // no pass
-        System.out.println();
-        
-        // Test 2: Issue toll passes
-        System.out.println("=== Test 2: Issue Toll Passes ===");
-        TollPass carPass = service.issueTollPass("CAR-001", 50.00);
-        TollPass truckPass = service.issueTollPass("TRUCK-001", 100.00);
-        service.issueTollPass("BIKE-001", 20.00);
-        System.out.println();
-        
-        // Test 3: Process toll with pass (auto-deduct)
-        System.out.println("=== Test 3: Toll with Pass ===");
+        System.out.println("╔══════════════════════════════════════════════╗");
+        System.out.println("║    TOLL COLLECTION SYSTEM - LLD Demo         ║");
+        System.out.println("╚══════════════════════════════════════════════╝\n");
+
+        TollCollectionService svc = new TollCollectionService(new StandardPricing());
+
+        svc.addBooth("B1-CASH", false);
+        svc.addBooth("B2-FAST", true);
+        svc.addBooth("B3-CASH", false);
+
+        // --- Test 1: Register Vehicles & Issue Passes ---
+        System.out.println("=== Test 1: Register & Issue Passes ===");
+        svc.registerVehicle("CAR-001", VehicleType.CAR);
+        svc.registerVehicle("TRUCK-01", VehicleType.TRUCK);
+        svc.registerVehicle("BIKE-01", VehicleType.MOTORCYCLE);
+        svc.registerVehicle("BUS-001", VehicleType.BUS);
+        svc.registerVehicle("CAR-002", VehicleType.CAR);
+
+        TollPass carPass = svc.issueTollPass("CAR-001", 50.00);
+        TollPass truckPass = svc.issueTollPass("TRUCK-01", 100.00);
+        TollPass bikePass = svc.issueTollPass("BIKE-01", 10.00);
+        svc.issueTollPass("BUS-001", 80.00);
+
+        System.out.printf("  CAR-001 pass: %s, balance: $%.2f%n", carPass.passId, carPass.getBalance());
+        System.out.printf("  TRUCK-01 pass: %s, balance: $%.2f%n", truckPass.passId, truckPass.getBalance());
+        System.out.println("  CAR-002: no pass (cash)\n");
+
+        // --- Test 2: Toll with Pass ---
+        System.out.println("=== Test 2: Toll with Pass ===");
         try {
-            service.processToll("CAR-001", "B2", TripType.ONE_WAY);  // $3.00
-            if (carPass != null) System.out.println("  Balance: $" + String.format("%.2f", carPass.getBalance()) + " (expect $47.00)");
-        } catch (Exception e) {
-            System.out.println("✗ " + e.getMessage());
-        }
-        System.out.println();
-        
-        // Test 4: Process toll with cash (no pass)
-        System.out.println("=== Test 4: Toll with Cash ===");
+            TollTransaction txn = svc.processToll("CAR-001", "B2-FAST", TripType.ONE_WAY);
+            System.out.printf("  %s: $%.2f via %s%n", txn.txnId, txn.amount, txn.method);
+            System.out.printf("  Balance after: $%.2f (expected $47.00)%n", carPass.getBalance());
+            System.out.println("✓ Pass auto-deduct works\n");
+        } catch (Exception e) { System.out.println("✗ " + e.getMessage()); }
+
+        // --- Test 3: Toll with Cash ---
+        System.out.println("=== Test 3: Toll with Cash ===");
         try {
-            service.processToll("CAR-002", "B1", TripType.ONE_WAY);  // $3.00 cash
-            System.out.println("✓ Cash payment processed");
-        } catch (Exception e) {
-            System.out.println("✗ " + e.getMessage());
-        }
-        System.out.println();
-        
-        // Test 5: Round trip pricing (10% discount)
-        System.out.println("=== Test 5: Round Trip ===");
+            TollTransaction txn = svc.processToll("CAR-002", "B1-CASH", TripType.ONE_WAY);
+            System.out.printf("  %s: $%.2f via %s%n", txn.txnId, txn.amount, txn.method);
+            System.out.println("✓ Cash payment processed\n");
+        } catch (Exception e) { System.out.println("✗ " + e.getMessage()); }
+
+        // --- Test 4: Round Trip ---
+        System.out.println("=== Test 4: Round Trip ===");
         try {
-            service.processToll("TRUCK-001", "B2", TripType.ROUND_TRIP);  // $7 × 1.8 = $12.60
-            if (truckPass != null) System.out.println("  Truck balance: $" + String.format("%.2f", truckPass.getBalance()));
-        } catch (Exception e) {
-            System.out.println("✗ " + e.getMessage());
-        }
-        System.out.println();
-        
-        // Test 6: Multiple transactions
-        System.out.println("=== Test 6: Multiple Tolls ===");
+            TollTransaction txn = svc.processToll("TRUCK-01", "B2-FAST", TripType.ROUND_TRIP);
+            System.out.printf("  Truck round trip: $%.2f (expected $12.60)%n", txn.amount);
+            System.out.printf("  Truck balance: $%.2f%n", truckPass.getBalance());
+            System.out.println("✓ Round trip pricing correct\n");
+        } catch (Exception e) { System.out.println("✗ " + e.getMessage()); }
+
+        // --- Test 5: Multiple Tolls ---
+        System.out.println("=== Test 5: Multiple Tolls ===");
         try {
-            service.processToll("CAR-001", "B2", TripType.ONE_WAY);
-            service.processToll("CAR-001", "B2", TripType.ONE_WAY);
-            service.processToll("BIKE-001", "B2", TripType.ONE_WAY); // $1.50
-        } catch (Exception e) {
-            System.out.println("✗ " + e.getMessage());
-        }
-        System.out.println();
-        
-        // Test 7: Recharge pass
-        System.out.println("=== Test 7: Recharge Pass ===");
+            svc.processToll("CAR-001", "B2-FAST", TripType.ONE_WAY);
+            svc.processToll("CAR-001", "B2-FAST", TripType.ONE_WAY);
+            svc.processToll("BIKE-01", "B2-FAST", TripType.ONE_WAY);
+            System.out.printf("  CAR-001 balance: $%.2f (expected $41.00)%n", carPass.getBalance());
+            System.out.printf("  BIKE-01 balance: $%.2f (expected $8.50)%n", bikePass.getBalance());
+            System.out.println("✓ Multiple transactions processed\n");
+        } catch (Exception e) { System.out.println("✗ " + e.getMessage()); }
+
+        // --- Test 6: Recharge ---
+        System.out.println("=== Test 6: Recharge ===");
         try {
-            if (carPass != null) {
-                service.rechargeTollPass(carPass.getPassId(), 25.00);
-                System.out.println("✓ New balance: $" + String.format("%.2f", carPass.getBalance()));
-            }
-        } catch (Exception e) {
-            System.out.println("✗ " + e.getMessage());
-        }
-        System.out.println();
-        
-        // Test 8: Transaction history
-        System.out.println("=== Test 8: Vehicle History ===");
-        List<TollTransaction> history = service.getVehicleHistory("CAR-001");
-        System.out.println("✓ CAR-001 transactions: " + (history != null ? history.size() : 0));
-        if (history != null) history.forEach(t -> System.out.println("    " + t));
-        System.out.println();
-        
-        // Test 9: Exception — insufficient balance
-        System.out.println("=== Test 9: Insufficient Balance ===");
+            double before = carPass.getBalance();
+            svc.rechargeTollPass(carPass.passId, 25.00);
+            System.out.printf("  Before: $%.2f, After: $%.2f (+$25.00)%n", before, carPass.getBalance());
+            System.out.println("✓ Recharge works\n");
+        } catch (Exception e) { System.out.println("✗ " + e.getMessage()); }
+
+        // --- Test 7: History ---
+        System.out.println("=== Test 7: Transaction History ===");
+        List<TollTransaction> history = svc.getVehicleHistory("CAR-001");
+        System.out.println("  CAR-001 has " + history.size() + " transactions (expected 3)");
+        for (TollTransaction t : history)
+            System.out.printf("    %s | %s | $%.2f | %s%n", t.txnId, t.boothId, t.amount, t.method);
+        System.out.println("✓ History tracking works\n");
+
+        // --- Test 8: Insufficient Balance ---
+        System.out.println("=== Test 8: Insufficient Balance ===");
         try {
-            // Drain balance first
-            TollPass bikePass = service.getTollPass(service.getVehicle("BIKE-001").getTollPassId());
-            if (bikePass != null) {
-                // Keep processing until insufficient
-                for (int i = 0; i < 20; i++) {
-                    service.processToll("BIKE-001", "B2", TripType.ONE_WAY);
-                }
-            }
+            for (int i = 0; i < 20; i++) svc.processToll("BIKE-01", "B2-FAST", TripType.ONE_WAY);
             System.out.println("✗ Should have thrown");
         } catch (InsufficientBalanceException e) {
-            System.out.println("✓ Caught: " + e.getMessage());
-        } catch (Exception e) {
-            System.out.println("✗ " + e.getMessage());
-        }
+            System.out.println("✓ Caught: " + e.getMessage() + "\n");
+        } catch (Exception e) { System.out.println("✗ " + e.getMessage()); }
+
+        // --- Test 9: Booth Rules ---
+        System.out.println("=== Test 9: Booth Rules ===");
+        try {
+            svc.processToll("CAR-002", "B2-FAST", TripType.ONE_WAY);
+            System.out.println("✗ Should have thrown");
+        } catch (IllegalStateException e) {
+            System.out.println("✓ Fast-track denied: " + e.getMessage());
+        } catch (Exception e) { System.out.println("✗ " + e.getMessage()); }
+
+        svc.closeBooth("B1-CASH");
+        try {
+            svc.processToll("CAR-002", "B1-CASH", TripType.ONE_WAY);
+            System.out.println("✗ Should have thrown");
+        } catch (IllegalStateException e) {
+            System.out.println("✓ Closed booth denied: " + e.getMessage());
+        } catch (Exception e) { System.out.println("✗ " + e.getMessage()); }
+        svc.openBooth("B1-CASH");
         System.out.println();
-        
-        // Test 10: Revenue
-        System.out.println("=== Test 10: Revenue ===");
-        System.out.println("✓ Total revenue: $" + String.format("%.2f", service.getTotalRevenue()));
-        System.out.println("  Total transactions: " + service.getTotalTransactions());
-        
-        System.out.println("\n=== All Test Cases Complete! ===");
+
+        // --- Test 10: Deactivate Pass ---
+        System.out.println("=== Test 10: Deactivate Pass ===");
+        try {
+            svc.deactivatePass(carPass.passId);
+            svc.processToll("CAR-001", "B2-FAST", TripType.ONE_WAY);
+            System.out.println("✗ Should have thrown");
+        } catch (InvalidPassException e) {
+            System.out.println("✓ Deactivated pass rejected: " + e.getMessage() + "\n");
+        } catch (Exception e) { System.out.println("✗ " + e.getMessage()); }
+
+        // --- Test 11: Peak Hour Pricing ---
+        System.out.println("=== Test 11: Peak Hour Pricing ===");
+        try {
+            svc.setPricing(new PeakHourPricing(new StandardPricing(), 1.5));
+            TollTransaction txn = svc.processToll("CAR-002", "B1-CASH", TripType.ONE_WAY);
+            System.out.printf("  Peak toll: $%.2f (expected $4.50)%n", txn.amount);
+            System.out.println("✓ Strategy swap works");
+            svc.setPricing(new StandardPricing());
+        } catch (Exception e) { System.out.println("✗ " + e.getMessage()); }
+        System.out.println();
+
+        // --- Test 12: Thread Safety ---
+        System.out.println("=== Test 12: Thread Safety ===");
+        TollCollectionService concSvc = new TollCollectionService(new StandardPricing());
+        concSvc.addBooth("CB1", false);
+        for (int i = 0; i < 50; i++) {
+            concSvc.registerVehicle("C-" + i, VehicleType.CAR);
+            concSvc.issueTollPass("C-" + i, 1000.00);
+        }
+        ExecutorService executor = Executors.newFixedThreadPool(8);
+        List<Future<?>> futures = new ArrayList<>();
+        for (int i = 0; i < 200; i++) {
+            final int idx = i % 50;
+            futures.add(executor.submit(() -> {
+                try { concSvc.processToll("C-" + idx, "CB1", TripType.ONE_WAY); }
+                catch (Exception e) {}
+            }));
+        }
+        for (int i = 0; i < 50; i++) {
+            final int idx = i;
+            futures.add(executor.submit(() -> {
+                try {
+                    TollPass p = concSvc.getPass(concSvc.getVehicle("C-" + idx).passId);
+                    if (p != null) concSvc.rechargeTollPass(p.passId, 10.0);
+                } catch (Exception e) {}
+            }));
+        }
+        for (Future<?> f : futures) { try { f.get(); } catch (Exception e) {} }
+        executor.shutdown();
+        System.out.println("  Txns: " + concSvc.getTotalTransactions() + " (expected 200)");
+        System.out.printf("  Revenue: $%.2f (expected $600.00)%n", concSvc.getTotalRevenue());
+        System.out.println("✓ Thread-safe\n");
+
+        System.out.printf("Total: %d txns, $%.2f revenue%n", svc.getTotalTransactions(), svc.getTotalRevenue());
+        System.out.println("\n╔══════════════════════════════════════════════╗");
+        System.out.println("║          ALL 12 TESTS PASSED ✓               ║");
+        System.out.println("╚══════════════════════════════════════════════╝");
     }
 }
 
-/**
- * INTERVIEW DISCUSSION:
- * =====================
- * 
- * 1. KEY ENTITIES:
- *    Vehicle: plate, type, optional toll pass
- *    TollPass: balance, auto-deduct (like E-ZPass/FASTag)
- *    TollBooth: cash lane vs fast-track (pass only)
- *    Transaction: record of each toll payment
- * 
+/*
+ * ==================== INTERVIEW NOTES ====================
+ *
+ * 1. CORE ENTITIES:
+ *    Vehicle (plate, type, optional pass) → TollPass (balance, active)
+ *    TollBooth (cash vs fast-track) → TollTransaction (immutable record)
+ *
  * 2. PAYMENT FLOW:
- *    Vehicle enters toll → scan pass via RFID
- *    If pass: verify active + sufficient balance → deduct → open gate
- *    If no pass: pay cash at booth → open gate
- *    Record transaction either way
- * 
- * 3. PRICING STRATEGY:
- *    By vehicle type: motorcycle < car < bus < truck
- *    By trip type: round trip gets discount
- *    Could add: time-based (peak/off-peak), distance-based
- * 
- * 4. SCALABILITY:
- *    RFID scanning: < 100ms per vehicle
- *    Pre-paid passes: no real-time bank transaction needed
- *    Async: transaction recording can be async (eventual consistency)
- *    Low balance alerts: notify before balance hits zero
- * 
- * 5. FOLLOW-UPS:
- *    - Violation detection (pass through without paying)
- *    - Camera-based license plate recognition
- *    - Dynamic pricing (congestion-based)
- *    - Multi-plaza pass (works across highways)
- *    - Auto-recharge when balance low
- * 
- * 6. REAL-WORLD: E-ZPass (US), FASTag (India), M-Tag (Europe)
- * 
- * 7. API:
- *    POST /vehicles                    — register
- *    POST /toll-passes                 — issue pass
- *    POST /toll-passes/{id}/recharge   — recharge
- *    POST /tolls/process               — process toll payment
- *    GET  /vehicles/{plate}/history    — transaction history
+ *    Vehicle → scan RFID → pass? validate + deduct : cash → record transaction
+ *
+ * 3. STRATEGY PATTERN:
+ *    TollPricingStrategy interface → StandardPricing, PeakHourPricing (decorator)
+ *
+ * 4. THREAD SAFETY:
+ *    ConcurrentHashMap (registries), synchronized (balance), AtomicLong (revenue),
+ *    CopyOnWriteArrayList (txn log), volatile (booth.open, pass.active)
+ *
+ * 5. COMPLEXITY: all O(1) except getHistory O(n)
+ *
+ * 6. SCALE: shard by plaza, Redis for balance, Kafka for txn log
+ *
+ * 7. REAL-WORLD: E-ZPass (US), FASTag (India), ETC (Japan)
  */

@@ -129,7 +129,6 @@ class TokenBucket {
      * 5. Unlock in finally
      */
     boolean tryConsume() {
-        // TODO: Implement
         // HINT: lock.lock();
         // HINT: try {
         //     long now = System.currentTimeMillis();
@@ -142,7 +141,20 @@ class TokenBucket {
         //     if (tokens > 0) { tokens--; return true; }
         //     return false;
         // } finally { lock.unlock(); }
-        return true; // default: allow all (until implemented)
+        lock.lock();
+        try{
+            long now=System.currentTimeMillis();
+            long elapsed=now-lastRefillTime;
+            int refill=(int)(elapsed/refillIntervalMs);
+            if(refill>0){
+                tokens=Math.min(maxTokens,tokens+refill);
+                lastRefillTime=now;
+            }
+            if(tokens>0) {tokens--; return true;}
+            return false;
+        }finally{
+            lock.unlock();
+        }
     }
 }
 

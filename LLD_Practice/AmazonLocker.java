@@ -298,7 +298,7 @@ class Locker {
         // HINT: Sort by .comparing(c -> c.size.ordinal())
         // HINT: Return smallest available larger size
         return  compartments.stream().filter(c->c.status==CompartmentStatus.FREE && c.size.ordinal() > size.ordinal())
-        .sorted(Comparator.comparingInt(c -> c.size.ordinal())).findFirst().orElse(null);:
+        .sorted(Comparator.comparingInt(c -> c.size.ordinal())).findFirst().orElse(null);
     }
     
     /**

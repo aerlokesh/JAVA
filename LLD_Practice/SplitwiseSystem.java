@@ -249,7 +249,7 @@ public class SplitwiseSystem {
         
         // DELEGATE split calculation to the strategy (Strategy Pattern!)
         Map<String, Double> splits = strategy.calculateSplit(totalAmount, participants, splitDetails);
-        L
+
         // Create and store the expense
         String expenseId = "EXP_" + (++expenseCounter);
         Expense expense = new Expense(expenseId, description, totalAmount, paidBy, splits, strategy.getSplitType());
@@ -329,7 +329,7 @@ public class SplitwiseSystem {
         if (amount - debt > 0.01) throw new InvalidSettlementException("Settlement amount exceeds owed debt");
         
         // Reduce debt: receiver is lender, payer is borrower, negative amount to reduce
-        updateBalance(receiver, payer, -amount;
+        updateBalance(receiver, payer, -amount);
     }
     
     /**
